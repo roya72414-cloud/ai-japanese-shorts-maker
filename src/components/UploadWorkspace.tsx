@@ -57,29 +57,63 @@ export function UploadWorkspace() {
       const frames = await analyzeFrames(url);
       setSubInfo({ detected: frames.subtitleArea.detected, isStatic: frames.isStatic });
 
-      // Upload — stream the file body directly, tracking progress with XHR.
+      // ১. প্রিসাইনড ইউআরএল তৈরি
       setStage("uploading");
+      const urlRes = await fetch("/api/upload-url", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filename: f.name,
+          contentType: f.type || "video/mp4",
+        }),
+      });
+
+      if (!urlRes.ok) {
+        const errData = await urlRes.json().catch(() => ({}));
+        throw new Error(errData.error || "Failed to initiate direct upload");
+      }
+
+      const { uploadUrl, key, stored } = await urlRes.json();
+
+      // ২. সরাসরি Supabase S3-এ আপলোড (Vercel সীমা এড়াতে)
+      await new Promise<void>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("PUT", uploadUrl);
+        xhr.setRequestHeader("Content-Type", f.type || "video/mp4");
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) setProgress(Math.round((e.loaded / e.total) * 100));
+        };
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) resolve();
+          else reject(new Error(`Storage upload failed (${xhr.status})`));
+        };
+        xhr.onerror = () => reject(new Error("Direct upload failed. Check your network."));
+        xhr.send(f);
+      });
+
+      setStage("finishing");
+
+      // ৩. ডাটাবেজে ভিডিও এন্ট্রি তৈরি
       const params = new URLSearchParams({
         filename: f.name,
         type: f.type || "video/mp4",
         duration: String(probe.duration),
         width: String(probe.width),
         height: String(probe.height),
+        storageKey: key,
+        stored: stored,
       });
-      const created = await new Promise<{ id: number }>((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-        xhr.open("POST", `/api/videos?${params.toString()}`);
-        xhr.upload.onprogress = (e) => {
-          if (e.lengthComputable) setProgress(Math.round((e.loaded / e.total) * 100));
-        };
-        xhr.onload = () => {
-          if (xhr.status >= 200 && xhr.status < 300) resolve(JSON.parse(xhr.responseText));
-          else reject(new Error(`Upload failed (${xhr.status})`));
-        };
-        xhr.onerror = () => reject(new Error("Upload failed. Check your connection."));
-        xhr.send(f);
+
+      const videoRes = await fetch(`/api/videos?${params.toString()}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ storageKey: key, stored, size: f.size }),
       });
-      setStage("finishing");
+
+      if (!videoRes.ok) throw new Error(`Failed to register video (${videoRes.status})`);
+      const created = await videoRes.json();
+
+      // ৪. থাম্বনেইল ও সাবটাইটেল সেভ
       await fetch(`/api/videos/${created.id}/thumbnail`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -94,6 +128,7 @@ export function UploadWorkspace() {
           isStaticImage: frames.isStatic,
         }),
       });
+
       setStage("done");
       router.push(`/videos/${created.id}`);
     } catch (e) {
