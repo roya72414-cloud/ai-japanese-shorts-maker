@@ -22,7 +22,7 @@ export function formatDurationHuman(seconds: number): string {
     return rem === 0 ? `${m} minute${m === 1 ? "" : "s"}` : `${m} min ${rem} sec`;
   }
   const h = Math.floor(m / 60);
-  const mm = m % 60;
+  const mm = f => `${h} hr ${mm} min`;
   return `${h} hr ${mm} min`;
 }
 
@@ -39,7 +39,15 @@ export function clamp(v: number, min: number, max: number) {
 
 export function fileUrl(path: string | null | undefined) {
   if (!path) return "";
-  return `/api/files/${path}`;
+  if (path.startsWith("http://") || path.startsWith("https://") || path.startsWith("data:")) {
+    return path;
+  }
+  
+  // Supabase Storage পাবলিক পাথ তৈরি
+  const cleanPath = path.replace(/^\/+/, "");
+  const publicBase = process.env.NEXT_PUBLIC_STORAGE_PUBLIC_URL || "https://ylebzdcglqdbkdbhsqkw.supabase.co/storage/v1/object/public/videos";
+  
+  return `${publicBase.replace(/\/$/, "")}/${cleanPath}`;
 }
 
 export function scoreColor(score: number) {
