@@ -12,7 +12,7 @@ export async function GET(
 
     const storagePublicUrl =
       process.env.NEXT_PUBLIC_STORAGE_PUBLIC_URL ||
-      "https://ylebzdcglqdbkdbhsqkw.supabase.co/storage/v1/object/public/videos";
+      "https://ylebzdcglqdbkobhsqkw.supabase.co/storage/v1/object/public/videos";
 
     const targetUrl = `${storagePublicUrl.replace(/\/$/, "")}/${fullPath}`;
 
