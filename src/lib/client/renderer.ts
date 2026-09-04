@@ -1,0 +1,398 @@
+"use client";
+
+import type { CropSettings, SubtitleArea, TranscriptSegment } from "@/db/schema";
+import { getTemplate, type CaptionTemplate, type SubtitleMode } from "@/lib/templates";
+
+export const OUT_W = 1080;
+export const OUT_H = 1920;
+
+export type RenderOptions = {
+  startTime: number;
+  endTime: number;
+  templateId: string;
+  subtitleMode: SubtitleMode | string;
+  crop: CropSettings;
+  zoom: number; // 1..1.3 user zoom on top of motion
+  motion: string; // ken-burns | slow-pan | subtle-scale | none
+  hook: string;
+  segments: TranscriptSegment[];
+  subtitleArea?: SubtitleArea | null;
+  preserveBurnedSubtitles: boolean;
+  level?: string | null;
+  showProgress?: boolean;
+};
+
+type Layout = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+};
+
+function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
+  const rr = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rr);
+  ctx.arcTo(x + w, y + h, x, y + h, rr);
+  ctx.arcTo(x, y + h, x, y, rr);
+  ctx.arcTo(x, y, x + w, y, rr);
+  ctx.closePath();
+}
+
+function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
+  const lines: string[] = [];
+  const hasSpaces = /\s/.test(text) && !/[぀-ヿ一-鿿]/.test(text);
+  if (hasSpaces) {
+    let line = "";
+    for (const word of text.split(/\s+/)) {
+      const test = line ? `${line} ${word}` : word;
+      if (ctx.measureText(test).width > maxWidth && line) {
+        lines.push(line);
+        line = word;
+      } else line = test;
+    }
+    if (line) lines.push(line);
+  } else {
+    let line = "";
+    for (const ch of Array.from(text)) {
+      const test = line + ch;
+      if (ctx.measureText(test).width > maxWidth && line) {
+        lines.push(line);
+        line = ch;
+      } else line = test;
+    }
+    if (line) lines.push(line);
+  }
+  return lines;
+}
+
+function easeInOut(t: number) {
+  return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+}
+
+/** Computes motion transform (scale, pan) at normalized progress p (0..1). */
+function motionAt(motion: string, p: number) {
+  const e = easeInOut(Math.min(1, Math.max(0, p)));
+  switch (motion) {
+    case "ken-burns":
+      return { scale: 1 + 0.06 * e, dx: -0.015 * e, dy: 0.01 * e, fgScale: 0.975 + 0.025 * e };
+    case "slow-pan":
+      return { scale: 1.06, dx: -0.03 + 0.06 * e, dy: 0, fgScale: 0.985 + 0.015 * e };
+    case "subtle-scale":
+      return { scale: 1 + 0.03 * Math.sin(p * Math.PI), dx: 0, dy: 0, fgScale: 0.985 + 0.015 * Math.sin(p * Math.PI) };
+    default:
+      return { scale: 1.02, dx: 0, dy: 0, fgScale: 1 };
+  }
+}
+
+export class ShortComposer {
+  private bgCanvas: HTMLCanvasElement;
+  private bgCtx: CanvasRenderingContext2D;
+  template: CaptionTemplate;
+
+  constructor(public opts: RenderOptions) {
+    this.template = getTemplate(opts.templateId);
+    this.bgCanvas = document.createElement("canvas");
+    this.bgCanvas.width = 135;
+    this.bgCanvas.height = 240;
+    this.bgCtx = this.bgCanvas.getContext("2d")!;
+  }
+
+  setOptions(opts: Partial<RenderOptions>) {
+    this.opts = { ...this.opts, ...opts };
+    this.template = getTemplate(this.opts.templateId);
+  }
+
+  currentSegment(time: number): TranscriptSegment | null {
+    const segs = this.opts.segments;
+    let best: TranscriptSegment | null = null;
+    for (const s of segs) {
+      if (time >= s.start - 0.15 && time <= s.end + 0.9) best = s;
+    }
+    return best;
+  }
+
+  private foregroundLayout(video: HTMLVideoElement | HTMLCanvasElement, fgScale: number): Layout {
+    const vw = "videoWidth" in video ? video.videoWidth || 16 : video.width;
+    const vh = "videoHeight" in video ? video.videoHeight || 9 : video.height;
+    const { crop, zoom } = this.opts;
+    const aspect = vw / vh;
+    if (crop.layout === "fill") {
+      // Center crop to 9:16 (may cut sides). Zoom + offset pan.
+      const h = OUT_H * zoom * fgScale;
+      const w = h * aspect;
+      const x = (OUT_W - w) / 2 + crop.offsetX * Math.max(0, (w - OUT_W) / 2);
+      const y = (OUT_H - h) / 2;
+      return { x, y, w, h };
+    }
+    const w = OUT_W * Math.min(1, zoom) * fgScale;
+    const h = w / aspect;
+    const centerY = crop.layout === "top" ? OUT_H * 0.36 : OUT_H * 0.47;
+    const y = centerY - h / 2 + crop.offsetY * OUT_H * 0.12;
+    return { x: (OUT_W - w) / 2, y, w, h };
+  }
+
+  draw(ctx: CanvasRenderingContext2D, video: HTMLVideoElement | HTMLCanvasElement, time: number) {
+    const { startTime, endTime, motion, hook, subtitleMode, preserveBurnedSubtitles } = this.opts;
+    const t = this.template;
+    const p = (time - startTime) / Math.max(0.1, endTime - startTime);
+    const m = motionAt(motion, p);
+
+    // 1. Background: blurred, slowly moving source frame under a template tint
+    ctx.fillStyle = t.bg;
+    ctx.fillRect(0, 0, OUT_W, OUT_H);
+    const bc = this.bgCtx;
+    bc.filter = "blur(6px)";
+    const vw = "videoWidth" in video ? video.videoWidth || 16 : video.width;
+    const vh = "videoHeight" in video ? video.videoHeight || 9 : video.height;
+    const coverScale = Math.max(this.bgCanvas.width / vw, this.bgCanvas.height / vh) * m.scale;
+    const bw = vw * coverScale;
+    const bh = vh * coverScale;
+    bc.drawImage(
+      video,
+      (this.bgCanvas.width - bw) / 2 + m.dx * this.bgCanvas.width,
+      (this.bgCanvas.height - bh) / 2 + m.dy * this.bgCanvas.height,
+      bw,
+      bh,
+    );
+    bc.filter = "none";
+    ctx.drawImage(this.bgCanvas, 0, 0, OUT_W, OUT_H);
+    const grad = ctx.createLinearGradient(0, 0, 0, OUT_H);
+    grad.addColorStop(0, hexToRgba(t.bg, 0.78));
+    grad.addColorStop(0.5, hexToRgba(t.bg2, 0.55));
+    grad.addColorStop(1, hexToRgba(t.bg, 0.88));
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, OUT_W, OUT_H);
+
+    // 2. Foreground video (subtitle-safe: never cropped in "fit" layout)
+    const fg = this.foregroundLayout(video, m.fgScale);
+    ctx.save();
+    ctx.shadowColor = "rgba(0,0,0,0.5)";
+    ctx.shadowBlur = 40;
+    ctx.shadowOffsetY = 16;
+    if (this.opts.crop.layout !== "fill") {
+      roundRect(ctx, fg.x, fg.y, fg.w, fg.h, 28);
+      ctx.fillStyle = "#000";
+      ctx.fill();
+      ctx.shadowColor = "transparent";
+      ctx.clip();
+    }
+    ctx.drawImage(video, fg.x, fg.y, fg.w, fg.h);
+    ctx.restore();
+
+    // 3. Badge (template / level)
+    const badge = this.opts.level ? `JLPT ${this.opts.level}` : t.badge;
+    if (badge) {
+      ctx.save();
+      ctx.font = `700 34px ${t.jaFont}`;
+      const w = ctx.measureText(badge).width + 44;
+      roundRect(ctx, 48, 72, w, 60, 30);
+      ctx.fillStyle = t.accent;
+      ctx.fill();
+      ctx.fillStyle = t.id === "vocabulary" ? "#ffffff" : "#0b0b12";
+      ctx.textBaseline = "middle";
+      ctx.fillText(badge, 70, 103);
+      ctx.restore();
+    }
+
+    // 4. Hook card above the video
+    if (hook) {
+      ctx.save();
+      ctx.font = `${t.weight} 58px ${t.jaFont}`;
+      const lines = wrapText(ctx, hook, OUT_W - 200);
+      const lineH = 72;
+      const boxH = lines.length * lineH + 40;
+      const boxY = Math.max(150, fg.y - boxH - 44);
+      const boxW = Math.min(OUT_W - 96, Math.max(...lines.map((l) => ctx.measureText(l).width)) + 88);
+      if (t.pillStyle !== "none") {
+        roundRect(ctx, (OUT_W - boxW) / 2, boxY, boxW, boxH, t.pillStyle === "rounded" ? 32 : 8);
+        ctx.fillStyle = t.hookBg;
+        ctx.fill();
+      }
+      ctx.fillStyle = t.hookColor;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      lines.forEach((l, i) => ctx.fillText(l, OUT_W / 2, boxY + 20 + lineH * i + lineH / 2));
+      ctx.restore();
+    }
+
+    // 5. Generated captions — skipped entirely in "preserve" mode so burned-in
+    //    subtitles are never duplicated. Drawn in the panel BELOW the video.
+    if (subtitleMode !== "preserve") {
+      const seg = this.currentSegment(time);
+      if (seg) {
+        const showRomaji = subtitleMode.includes("romaji") && seg.romaji;
+        const showEn = subtitleMode.includes("en") && seg.en;
+        const revealEn = t.id !== "listening-challenge" || p > 0.55;
+        ctx.save();
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        const maxW = OUT_W - 140;
+        let y = fg.y + fg.h + 70;
+        // Japanese line
+        ctx.font = `${t.weight} ${t.jaSize}px ${t.jaFont}`;
+        const jaLines = wrapText(ctx, seg.ja, maxW);
+        if (preserveBurnedSubtitles && subtitleMode === "ja") {
+          // If burned subtitles already include Japanese we still draw (user asked), but smaller.
+          ctx.font = `${t.weight} ${Math.round(t.jaSize * 0.85)}px ${t.jaFont}`;
+        }
+        if (t.id === "vocabulary" || t.id === "conversation") {
+          const totalH = jaLines.length * (t.jaSize + 12) + (showRomaji ? 52 : 0) + (showEn ? 56 : 0) + 56;
+          roundRect(ctx, 60, y - 28, OUT_W - 120, totalH, 32);
+          ctx.fillStyle = t.id === "vocabulary" ? "#ffffff" : "rgba(255,255,255,0.10)";
+          ctx.fill();
+        }
+        for (const l of jaLines) {
+          ctx.lineWidth = 10;
+          ctx.lineJoin = "round";
+          ctx.strokeStyle = t.jaStroke;
+          if (t.jaStroke !== "rgba(255,255,255,0)" && t.jaStroke !== "rgba(0,0,0,0)") ctx.strokeText(l, OUT_W / 2, y);
+          ctx.fillStyle = t.jaColor;
+          ctx.fillText(l, OUT_W / 2, y);
+          y += t.jaSize + 12;
+        }
+        if (showRomaji) {
+          ctx.font = `600 38px ${t.jaFont}`;
+          for (const l of wrapText(ctx, seg.romaji, maxW)) {
+            ctx.fillStyle = t.romajiColor;
+            ctx.fillText(l, OUT_W / 2, y + 6);
+            y += 48;
+          }
+        }
+        if (showEn && revealEn) {
+          ctx.font = `500 40px ${t.jaFont}`;
+          for (const l of wrapText(ctx, seg.en, maxW)) {
+            ctx.fillStyle = t.enColor;
+            ctx.fillText(l, OUT_W / 2, y + 10);
+            y += 52;
+          }
+        } else if (showEn && !revealEn) {
+          ctx.font = `600 40px ${t.jaFont}`;
+          ctx.fillStyle = t.enColor;
+          ctx.fillText("Can you understand it? …", OUT_W / 2, y + 10);
+        }
+        ctx.restore();
+      }
+    }
+
+    // 6. Progress bar
+    if (this.opts.showProgress !== false) {
+      ctx.fillStyle = "rgba(255,255,255,0.18)";
+      ctx.fillRect(0, OUT_H - 10, OUT_W, 10);
+      ctx.fillStyle = t.accent;
+      ctx.fillRect(0, OUT_H - 10, OUT_W * Math.min(1, Math.max(0, p)), 10);
+    }
+  }
+}
+
+function hexToRgba(hex: string, a: number) {
+  const h = hex.replace("#", "");
+  const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h;
+  const n = parseInt(full, 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+}
+
+export function pickRecorderMime(): { mime: string; format: "mp4" | "webm" } | null {
+  if (typeof MediaRecorder === "undefined") return null;
+  const candidates: Array<[string, "mp4" | "webm"]> = [
+    ['video/mp4;codecs="avc1.640028,mp4a.40.2"', "mp4"],
+    ['video/mp4;codecs="avc1.42E01E,mp4a.40.2"', "mp4"],
+    ["video/mp4", "mp4"],
+    ['video/webm;codecs="h264,opus"', "webm"],
+    ["video/webm;codecs=vp9,opus", "webm"],
+    ["video/webm", "webm"],
+  ];
+  for (const [mime, format] of candidates) {
+    if (MediaRecorder.isTypeSupported(mime)) return { mime, format };
+  }
+  return null;
+}
+
+/**
+ * Renders a Short to a video Blob by playing the source segment in a hidden
+ * element, compositing frames to a 1080x1920 canvas, and recording the canvas
+ * stream together with the original Japanese audio.
+ */
+export async function renderShort(
+  sourceUrl: string,
+  opts: RenderOptions,
+  onProgress?: (p: number) => void,
+  fps = 30,
+): Promise<{ blob: Blob; format: "mp4" | "webm"; mime: string }> {
+  const rec = pickRecorderMime();
+  if (!rec) throw new Error("This browser cannot record video. Please use Chrome or Edge.");
+
+  const video = document.createElement("video");
+  video.crossOrigin = "anonymous";
+  video.preload = "auto";
+  video.playsInline = true;
+  video.src = sourceUrl;
+  await new Promise<void>((res, rej) => {
+    video.onloadedmetadata = () => res();
+    video.onerror = () => rej(new Error("Could not load source video"));
+  });
+
+  const canvas = document.createElement("canvas");
+  canvas.width = OUT_W;
+  canvas.height = OUT_H;
+  const ctx = canvas.getContext("2d")!;
+  const composer = new ShortComposer(opts);
+
+  const ac = new AudioContext();
+  const srcNode = ac.createMediaElementSource(video);
+  const dest = ac.createMediaStreamDestination();
+  srcNode.connect(dest);
+
+  const stream = canvas.captureStream(fps);
+  for (const track of dest.stream.getAudioTracks()) stream.addTrack(track);
+
+  const recorder = new MediaRecorder(stream, {
+    mimeType: rec.mime,
+    videoBitsPerSecond: 8_000_000,
+    audioBitsPerSecond: 160_000,
+  });
+  const chunks: BlobPart[] = [];
+  recorder.ondataavailable = (e) => {
+    if (e.data.size) chunks.push(e.data);
+  };
+
+  await new Promise<void>((res) => {
+    video.currentTime = opts.startTime;
+    video.onseeked = () => res();
+    setTimeout(res, 2000);
+  });
+  composer.draw(ctx, video, opts.startTime);
+
+  const done = new Promise<Blob>((res) => {
+    recorder.onstop = () => res(new Blob(chunks, { type: rec.mime }));
+  });
+
+  await ac.resume();
+  recorder.start(500);
+  await video.play();
+
+  await new Promise<void>((res) => {
+    let raf = 0;
+    const tick = () => {
+      const t = video.currentTime;
+      composer.draw(ctx, video, t);
+      onProgress?.(Math.min(1, (t - opts.startTime) / Math.max(0.1, opts.endTime - opts.startTime)));
+      if (t >= opts.endTime || video.ended) {
+        cancelAnimationFrame(raf);
+        video.pause();
+        res();
+        return;
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+  });
+
+  recorder.stop();
+  const blob = await done;
+  srcNode.disconnect();
+  await ac.close();
+  video.src = "";
+  return { blob, format: rec.format, mime: rec.mime };
+}
