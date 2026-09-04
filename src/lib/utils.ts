@@ -46,7 +46,7 @@ export function fileUrl(path: string | null | undefined) {
   const cleanPath = path.replace(/^\/+/, "");
   const publicBase =
     process.env.NEXT_PUBLIC_STORAGE_PUBLIC_URL ||
-    "https://ylebzdcglqdbkdbhsqkw.supabase.co/storage/v1/object/public/videos";
+    "https://ylebzdcglqdbkobhsqkw.supabase.co/storage/v1/object/public/videos";
   
   return `${publicBase.replace(/\/$/, "")}/${cleanPath}`;
 }
