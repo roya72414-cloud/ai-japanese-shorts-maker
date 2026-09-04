@@ -22,7 +22,7 @@ export function formatDurationHuman(seconds: number): string {
     return rem === 0 ? `${m} minute${m === 1 ? "" : "s"}` : `${m} min ${rem} sec`;
   }
   const h = Math.floor(m / 60);
-  const mm = f => `${h} hr ${mm} min`;
+  const mm = m % 60;
   return `${h} hr ${mm} min`;
 }
 
@@ -43,9 +43,10 @@ export function fileUrl(path: string | null | undefined) {
     return path;
   }
   
-  // Supabase Storage পাবলিক পাথ তৈরি
   const cleanPath = path.replace(/^\/+/, "");
-  const publicBase = process.env.NEXT_PUBLIC_STORAGE_PUBLIC_URL || "https://ylebzdcglqdbkdbhsqkw.supabase.co/storage/v1/object/public/videos";
+  const publicBase =
+    process.env.NEXT_PUBLIC_STORAGE_PUBLIC_URL ||
+    "https://ylebzdcglqdbkdbhsqkw.supabase.co/storage/v1/object/public/videos";
   
   return `${publicBase.replace(/\/$/, "")}/${cleanPath}`;
 }
