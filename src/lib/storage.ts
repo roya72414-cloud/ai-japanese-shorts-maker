@@ -18,7 +18,8 @@ export function absolutePath(relative: string) {
   return abs;
 }
 
-export async function removeFile(relative: string) {
+export async function removeFile(relative: string | null | undefined) {
+  if (!relative) return;
   try {
     const p = absolutePath(relative);
     if (fs.existsSync(p)) fs.unlinkSync(p);
