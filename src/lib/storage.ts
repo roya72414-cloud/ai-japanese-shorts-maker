@@ -1,4 +1,31 @@
+import fs from "node:fs";
+import path from "node:path";
 import { S3Client, PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
+
+export const DATA_DIR = path.join(process.cwd(), "data");
+
+export function ensureDir(sub: string) {
+  const dir = path.join(DATA_DIR, sub);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  return dir;
+}
+
+export function absolutePath(relative: string) {
+  const abs = path.normalize(path.join(DATA_DIR, relative));
+  if (!abs.startsWith(DATA_DIR)) throw new Error("Invalid path");
+  return abs;
+}
+
+export async function removeFile(relative: string) {
+  try {
+    const p = absolutePath(relative);
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+  } catch {
+    // ignore
+  }
+}
 
 const STORAGE_ENDPOINT = process.env.STORAGE_ENDPOINT || "";
 const STORAGE_REGION = process.env.STORAGE_REGION || "ap-southeast-2";
