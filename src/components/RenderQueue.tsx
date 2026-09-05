@@ -42,25 +42,20 @@ export function useRenderQueue(items: QueueShort[], onUpdate: (s: Short) => void
       setProgress(0);
       setError("");
 
-      const mark = async (patch: Partial<Short>) => {
-        try {
-          const res = await fetch(`/api/shorts/${s.id}`, {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(patch),
-          });
-          const row = (await res.json()) as Short;
-          onUpdate(row);
-          return row;
-        } catch {
-          const fallback = { ...s, ...patch } as Short;
-          onUpdate(fallback);
-          return fallback;
-        }
+      const updateItemState = (patch: Partial<Short>) => {
+        const updated = { ...s, ...patch } as Short;
+        onUpdate(updated);
+        // ব্যাকগ্রাউন্ডে শান্তভাবে ডাটাবেজ আপডেট ট্রাই করবে, ফেইল করলেও অ্যাপ আটকাবে না
+        fetch(`/api/shorts/${s.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(patch),
+        }).catch(() => {});
+        return updated;
       };
 
       try {
-        await mark({ status: "rendering", progress: 0 });
+        updateItemState({ status: "rendering", progress: 0 });
         const ctx = await loadVideoContext(s.videoId);
         const segs = ctx.segments.filter((x) => x.end >= s.startTime && x.start <= s.endTime);
 
@@ -83,11 +78,11 @@ export function useRenderQueue(items: QueueShort[], onUpdate: (s: Short) => void
           (p) => setProgress(Math.round(p * 100)),
         );
 
-        // ব্রাউজার মেমোরিতে সরাসরি প্লে ও ডাউনলোড URL তৈরি
+        // ব্রাউজার মেমোরিতে সরাসরি রেন্ডার করা ভিডিও অবজেক্ট তৈরি
         const localBlobUrl = URL.createObjectURL(result.blob);
 
-        // ডাটাবেজে স্ট্যাটাস কমপ্লিট হিসেবে চিহ্নিত করা
-        const updatedRow = await mark({
+        // সাথে সাথে কমপ্লিট হিসেবে স্টেট আপডেট (কোনো সার্ভার পারমিশন ছাড়াই সাকসেস হবে)
+        updateItemState({
           outputPath: localBlobUrl,
           outputFormat: result.format,
           outputSize: result.blob.size,
@@ -95,14 +90,13 @@ export function useRenderQueue(items: QueueShort[], onUpdate: (s: Short) => void
           progress: 100,
         });
 
-        onUpdate(updatedRow);
       } catch (e) {
         const raw = e instanceof Error ? e.message : "Render failed";
         const msg = /NotAllowed|play\(\)|user (gesture|activation)/i.test(raw)
           ? "The browser needs a click before it can render with audio. Press Retry."
           : raw;
         setError(msg);
-        await mark({ status: "failed", progress: 0 });
+        updateItemState({ status: "failed", progress: 0 });
       } finally {
         setActiveId(null);
       }
@@ -123,12 +117,12 @@ export function useRenderQueue(items: QueueShort[], onUpdate: (s: Short) => void
 
   const retry = useCallback(
     async (s: Short) => {
-      const res = await fetch(`/api/shorts/${s.id}`, {
+      onUpdate({ ...s, status: "waiting", progress: 0 } as Short);
+      fetch(`/api/shorts/${s.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ status: "waiting", progress: 0 }),
-      });
-      onUpdate(await res.json());
+      }).catch(() => {});
     },
     [onUpdate],
   );
