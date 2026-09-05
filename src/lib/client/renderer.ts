@@ -22,12 +22,7 @@ export type RenderOptions = {
   showProgress?: boolean;
 };
 
-type Layout = {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-};
+type Layout = { x: number; y: number; w: number; h: number };
 
 function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
   const rr = Math.min(r, w / 2, h / 2);
@@ -147,13 +142,7 @@ export class ShortComposer {
     const coverScale = Math.max(this.bgCanvas.width / vw, this.bgCanvas.height / vh) * m.scale;
     const bw = vw * coverScale;
     const bh = vh * coverScale;
-    bc.drawImage(
-      video,
-      (this.bgCanvas.width - bw) / 2 + m.dx * this.bgCanvas.width,
-      (this.bgCanvas.height - bh) / 2 + m.dy * this.bgCanvas.height,
-      bw,
-      bh,
-    );
+    bc.drawImage(video, (this.bgCanvas.width - bw) / 2 + m.dx * this.bgCanvas.width, (this.bgCanvas.height - bh) / 2 + m.dy * this.bgCanvas.height, bw, bh);
     bc.filter = "none";
     ctx.drawImage(this.bgCanvas, 0, 0, OUT_W, OUT_H);
 
@@ -313,9 +302,8 @@ export async function renderShort(
   fps = 30,
 ): Promise<{ blob: Blob; format: "mp4" | "webm"; mime: string }> {
   const rec = pickRecorderMime();
-  if (!rec) throw new Error("This browser cannot record video. Please use Chrome or Edge.");
+  if (!rec) throw new Error("Please use Chrome or Edge browser.");
 
-  // ভিডিও যাতে ব্রাউজার অপ্টিমাইজেশনের কারণে ব্যাকগ্রাউন্ডে ফ্রিজ না হয়, তাই দৃশ্যমান ডক নোডে অ্যাক্টিভ রাখা
   const video = document.createElement("video");
   video.crossOrigin = "anonymous";
   video.preload = "auto";
@@ -323,17 +311,18 @@ export async function renderShort(
   video.muted = false;
   video.src = sourceUrl;
   video.style.position = "fixed";
-  video.style.top = "-9999px";
-  video.style.left = "-9999px";
-  video.style.width = "320px";
-  video.style.height = "180px";
+  video.style.top = "0px";
+  video.style.left = "0px";
+  video.style.width = "4px";
+  video.style.height = "4px";
   video.style.opacity = "0.01";
   video.style.pointerEvents = "none";
+  video.style.zIndex = "-1";
   document.body.appendChild(video);
 
   await new Promise<void>((res, rej) => {
     video.onloadedmetadata = () => res();
-    video.onerror = () => rej(new Error("Could not load source video metadata"));
+    video.onerror = () => rej(new Error("Could not load source video"));
   });
 
   const canvas = document.createElement("canvas");
@@ -342,7 +331,8 @@ export async function renderShort(
   const ctx = canvas.getContext("2d", { alpha: false })!;
   const composer = new ShortComposer(opts);
 
-  const ac = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+  const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+  const ac = new AudioContextClass();
   const srcNode = ac.createMediaElementSource(video);
   const dest = ac.createMediaStreamDestination();
   srcNode.connect(dest);
@@ -377,15 +367,17 @@ export async function renderShort(
   });
 
   await ac.resume();
-  recorder.start(100);
+  recorder.start(200);
   await video.play();
 
   const totalDuration = Math.max(0.1, opts.endTime - opts.startTime);
 
-  // ইন্টারভাল লুপ ব্যবহার করায় ব্রাউজার প্রতিটি ফ্রেম ড্র নিশ্চিত করবে (ভিডিও ফ্রিজ হবে না)
+  // requestVideoFrameCallback দিয়ে হার্ডওয়্যার পারফেক্ট অডিও-ভিডিও সিঙ্ক
   await new Promise<void>((res) => {
-    const intervalTime = 1000 / fps;
-    const interval = setInterval(() => {
+    let active = true;
+
+    const onFrame = () => {
+      if (!active) return;
       const t = video.currentTime;
       composer.draw(ctx, video, t);
 
@@ -393,11 +385,24 @@ export async function renderShort(
       onProgress?.(Math.min(0.99, elapsed / totalDuration));
 
       if (t >= opts.endTime || video.ended || video.paused) {
-        clearInterval(interval);
+        active = false;
         video.pause();
         res();
+        return;
       }
-    }, intervalTime);
+
+      if ("requestVideoFrameCallback" in video) {
+        (video as unknown as { requestVideoFrameCallback: (cb: () => void) => void }).requestVideoFrameCallback(onFrame);
+      } else {
+        requestAnimationFrame(onFrame);
+      }
+    };
+
+    if ("requestVideoFrameCallback" in video) {
+      (video as unknown as { requestVideoFrameCallback: (cb: () => void) => void }).requestVideoFrameCallback(onFrame);
+    } else {
+      requestAnimationFrame(onFrame);
+    }
   });
 
   recorder.stop();
