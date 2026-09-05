@@ -28,14 +28,31 @@ export async function PATCH(req: Request, { params }: Ctx) {
 }
 
 export async function DELETE(_req: Request, { params }: Ctx) {
-  const id = Number((await params).id);
-  const [video] = await db.select().from(videos).where(eq(videos.id, id));
-  if (video) {
-    const shortRows = await db.select().from(shorts).where(eq(shorts.videoId, id));
-    for (const s of shortRows) removeFile(s.outputPath);
-    removeFile(video.storagePath);
-    removeFile(video.thumbnailPath);
-    await db.delete(videos).where(eq(videos.id, id));
+  try {
+    const id = Number((await params).id);
+    if (!id) return Response.json({ error: "Invalid ID" }, { status: 400 });
+
+    const [video] = await db.select().from(videos).where(eq(videos.id, id));
+    if (video) {
+      // ১. চাইল্ড শর্টসগুলোর ফাইল ডিলিট
+      const shortRows = await db.select().from(shorts).where(eq(shorts.videoId, id));
+      for (const s of shortRows) {
+        if (s.outputPath) await Promise.resolve(removeFile(s.outputPath)).catch(() => {});
+      }
+
+      // ২. মূল ভিডিও ও থাম্বনেইল ফাইল স্টোরেজ থেকে রিমুভ
+      if (video.storagePath) await Promise.resolve(removeFile(video.storagePath)).catch(() => {});
+      if (video.thumbnailPath) await Promise.resolve(removeFile(video.thumbnailPath)).catch(() => {});
+
+      // ৩. সম্পর্কিত সব রেকর্ড ডেটাবেজ থেকে মুছে দেওয়া
+      await db.delete(shorts).where(eq(shorts.videoId, id));
+      await db.delete(moments).where(eq(moments.videoId, id));
+      await db.delete(transcripts).where(eq(transcripts.videoId, id));
+      await db.delete(videos).where(eq(videos.id, id));
+    }
+
+    return Response.json({ ok: true });
+  } catch (err) {
+    return Response.json({ error: err instanceof Error ? err.message : "Delete failed" }, { status: 500 });
   }
-  return Response.json({ ok: true });
 }
