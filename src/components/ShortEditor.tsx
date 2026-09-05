@@ -1,14 +1,12 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Download, Pause, Play, RefreshCw, Save, Sparkles } from "lucide-react";
 import type { Moment, Short, TranscriptSegment, Video } from "@/db/schema";
 import { OUT_H, OUT_W, ShortComposer, renderShort } from "@/lib/client/renderer";
 import { CAPTION_TEMPLATES, MOTION_OPTIONS, SUBTITLE_MODES } from "@/lib/templates";
 import { Button, Card, Progress, ScoreBadge, Segmented, StatusPill } from "@/components/ui";
-import { downloadShort } from "@/components/ShortCard";
 import { clamp, cn, fileUrl, formatTime } from "@/lib/utils";
 
 type Props = { short: Short; video: Video; moment: Moment | null; segments: TranscriptSegment[] };
@@ -26,7 +24,6 @@ const HOOK_LIBRARY: Record<string, string[]> = {
 };
 
 export function ShortEditor({ short: initial, video, moment, segments }: Props) {
-  const router = useRouter();
   const [s, setS] = useState<Short>(initial);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -35,6 +32,11 @@ export function ShortEditor({ short: initial, video, moment, segments }: Props) 
   const [error, setError] = useState("");
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(initial.startTime);
+  
+  // সদ্য জেনারেট হওয়া এক্স্যাক্ট ভিডিও ব্লব ধরে রাখার জন্য লোকাল স্টেট
+  const [generatedBlobUrl, setGeneratedBlobUrl] = useState<string | null>(null);
+  const [generatedFormat, setGeneratedFormat] = useState<string>("mp4");
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const composerRef = useRef<ShortComposer | null>(null);
@@ -71,7 +73,6 @@ export function ShortEditor({ short: initial, video, moment, segments }: Props) 
     composerRef.current.draw(c.getContext("2d")!, v, v.currentTime);
   }, [opts]);
 
-  // Redraw when settings change while paused
   useEffect(() => {
     if (!playing) drawNow();
   }, [opts, playing, drawNow]);
@@ -79,7 +80,8 @@ export function ShortEditor({ short: initial, video, moment, segments }: Props) 
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
-    v.muted = false; // অডিও নিশ্চিতভাবে চালু রাখার জন্য
+    v.muted = false;
+    v.volume = 1.0;
     const onReady = () => {
       v.currentTime = s.startTime;
     };
@@ -90,8 +92,7 @@ export function ShortEditor({ short: initial, video, moment, segments }: Props) 
       v.removeEventListener("loadeddata", onReady);
       v.removeEventListener("seeked", onSeeked);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [s.startTime, drawNow]);
 
   useEffect(() => {
     if (!playing) return;
@@ -122,7 +123,6 @@ export function ShortEditor({ short: initial, video, moment, segments }: Props) 
         await v.play();
         setPlaying(true);
       } catch {
-        // ব্রাউজার অডিও পলিসি ফলব্যাক
         v.muted = true;
         await v.play();
         setPlaying(true);
@@ -134,6 +134,7 @@ export function ShortEditor({ short: initial, video, moment, segments }: Props) 
     setS((prev) => ({ ...prev, ...patch }));
     setDirty(true);
   };
+
   const seek = (t: number) => {
     const v = videoRef.current!;
     v.currentTime = t;
@@ -143,11 +144,27 @@ export function ShortEditor({ short: initial, video, moment, segments }: Props) 
   const save = async () => {
     setSaving(true);
     const { title, hook, description, hashtags, startTime, endTime, template, subtitleMode, crop, zoom, motion } = s;
-    const res = await fetch(`/api/shorts/${s.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title, hook, description, hashtags, startTime, endTime, template, subtitleMode, crop, zoom, motion, status: s.status === "draft" ? "draft" : s.status }) });
+    const res = await fetch(`/api/shorts/${s.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, hook, description, hashtags, startTime, endTime, template, subtitleMode, crop, zoom, motion, status: s.status === "draft" ? "draft" : s.status }),
+    });
     const row = await res.json();
     setS((prev) => ({ ...prev, ...row }));
     setDirty(false);
     setSaving(false);
+  };
+
+  // জেনারেটেড ভিডিও সরাসরি ডিভাইসে ডাউনলোড করার ফাংশন
+  const triggerDownload = (url: string, ext: string) => {
+    const safeTitle = s.title.replace(/[^a-zA-Z0-9_\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff-]/g, "_").slice(0, 40);
+    const filename = `Short_${s.id}_${safeTitle || "japanese"}.${ext}`;
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
   };
 
   const exportShort = async () => {
@@ -155,48 +172,45 @@ export function ShortEditor({ short: initial, video, moment, segments }: Props) 
     setExporting(true);
     setError("");
     setExportProgress(0);
+
     try {
       if (dirty) await save();
-      
-      // ব্যাকগ্রাউন্ডে স্টেট নোটিফাই করা
-      fetch(`/api/shorts/${s.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "rendering", progress: 0 }) }).catch(() => {});
+
       setS((p) => ({ ...p, status: "rendering" }));
 
-      // ব্রাউজারে ভিডিও রেন্ডার সম্পন্ন করা
+      // হুবহু প্রিভিউ ক্যানভাসের কনফিগারেশন অনুযায়ী ফ্রেম বাই ফ্রেম এক্স্যাক্ট রেন্ডার
       const result = await renderShort(src, opts, (p) => setExportProgress(Math.round(p * 100)));
 
-      // সরাসরি ব্রাউজার মেমোরিতে অবজেক্ট URL তৈরি
+      // সরাসরি রেন্ডার হওয়া ভিডিও ব্লবের অবজেক্ট ইউআরএল তৈরি
       const localBlobUrl = URL.createObjectURL(result.blob);
+      setGeneratedBlobUrl(localBlobUrl);
+      setGeneratedFormat(result.format);
 
-      // কোনো সার্ভারলেস 413 এরর ছাড়াই স্বয়ংক্রিয়ভাবে ভিডিও ডাউনলোড ট্রিগার করা
-      const a = document.createElement("a");
-      a.href = localBlobUrl;
-      a.download = `${video.name || "short"}-${s.id}.${result.format}`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
+      // কোনো ভুল পুরানো ফাইল ছাড়াই এক্স্যাক্টলি রেন্ডার হওয়া নতুন ভিডিওটি সরাসরি ডাউনলোড শুরু হবে
+      triggerDownload(localBlobUrl, result.format);
 
-      // সফল হিসেবে স্টেট আপডেট
-      const completedShort = {
-        ...s,
+      setS((p) => ({
+        ...p,
+        status: "complete",
         outputPath: localBlobUrl,
         outputFormat: result.format,
         outputSize: result.blob.size,
-        status: "complete" as const,
-        progress: 100,
-      };
-      setS(completedShort);
+      }));
 
-      // সার্ভারকে মেটাডেটা আপডেট পাঠানো
+      // ডাটাবেজে রেন্ডার সাকসেস স্ট্যাটাস পাঠানো
       fetch(`/api/shorts/${s.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status: "complete", progress: 100, outputFormat: result.format, outputSize: result.blob.size }),
+        body: JSON.stringify({
+          status: "complete",
+          progress: 100,
+          outputFormat: result.format,
+          outputSize: result.blob.size,
+        }),
       }).catch(() => {});
 
     } catch (e) {
       setError(e instanceof Error ? e.message : "Export failed");
-      fetch(`/api/shorts/${s.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "failed" }) }).catch(() => {});
       setS((p) => ({ ...p, status: "failed" }));
     } finally {
       setExporting(false);
@@ -220,7 +234,9 @@ export function ShortEditor({ short: initial, video, moment, segments }: Props) 
     <div className="mx-auto max-w-[1400px] px-4 py-6 lg:px-8">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
-          <Link href={`/videos/${video.id}`} className="grid h-9 w-9 place-items-center rounded-lg border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"><ArrowLeft className="h-4 w-4" /></Link>
+          <Link href={`/videos/${video.id}`} className="grid h-9 w-9 place-items-center rounded-lg border border-slate-200 bg-white text-slate-600 hover:bg-slate-50">
+            <ArrowLeft className="h-4 w-4" />
+          </Link>
           <div>
             <h1 className="text-lg font-bold text-slate-900">Short Editor</h1>
             <p className="text-xs text-slate-500">{video.name} · <StatusPill status={s.status} /></p>
@@ -229,32 +245,60 @@ export function ShortEditor({ short: initial, video, moment, segments }: Props) 
         <div className="flex items-center gap-2">
           <Button onClick={regenerate}><RefreshCw className="h-4 w-4" /> Regenerate</Button>
           <Button onClick={save} loading={saving} disabled={!dirty}><Save className="h-4 w-4" /> Save</Button>
-          <Button variant="primary" onClick={exportShort} loading={exporting}><Sparkles className="h-4 w-4" /> {exporting ? `Rendering ${exportProgress}%` : "Export"}</Button>
-          {s.status === "complete" && s.outputPath && <Button variant="dark" onClick={() => downloadShort({ ...s, videoName: video.name })}><Download className="h-4 w-4" /> Download</Button>}
+          <Button variant="primary" onClick={exportShort} loading={exporting}>
+            <Sparkles className="h-4 w-4" /> {exporting ? `Rendering ${exportProgress}%` : "Export"}
+          </Button>
+          {(generatedBlobUrl || (s.status === "complete" && s.outputPath)) && (
+            <Button
+              variant="dark"
+              onClick={() => {
+                const targetUrl = generatedBlobUrl || s.outputPath!;
+                triggerDownload(targetUrl, generatedFormat || s.outputFormat || "mp4");
+              }}
+            >
+              <Download className="h-4 w-4" /> Download
+            </Button>
+          )}
         </div>
       </div>
+
       {exporting && <Progress value={exportProgress} className="mb-4" />}
       {error && <p className="mb-4 rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-600">{error}</p>}
 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_420px]">
-        {/* Left: preview */}
+        {/* ক্যানভাস প্রিভিউ */}
         <Card className="flex flex-col items-center bg-ink-900 p-6">
           <div className="relative w-full max-w-[340px]">
             <canvas ref={canvasRef} width={OUT_W} height={OUT_H} className="aspect-[9/16] w-full rounded-2xl bg-black shadow-2xl" />
             <video ref={videoRef} src={src} preload="auto" playsInline crossOrigin="anonymous" className="hidden" onLoadedData={drawNow} />
             <button onClick={togglePlay} className="absolute inset-0 grid place-items-center">
-              {!playing && <span className="grid h-16 w-16 place-items-center rounded-full bg-white/90 text-ink-900 shadow-xl"><Play className="ml-1 h-7 w-7 fill-current" /></span>}
+              {!playing && (
+                <span className="grid h-16 w-16 place-items-center rounded-full bg-white/90 text-ink-900 shadow-xl">
+                  <Play className="ml-1 h-7 w-7 fill-current" />
+                </span>
+              )}
             </button>
           </div>
           <div className="mt-4 flex w-full max-w-[340px] items-center gap-3 text-white">
-            <button onClick={togglePlay} className="grid h-9 w-9 place-items-center rounded-full bg-white/10 hover:bg-white/20">{playing ? <Pause className="h-4 w-4" /> : <Play className="ml-0.5 h-4 w-4" />}</button>
-            <input type="range" className="slider flex-1" min={s.startTime} max={s.endTime} step={0.05} value={clamp(time, s.startTime, s.endTime)} onChange={(e) => seek(Number(e.target.value))} style={{ ["--p" as string]: `${((clamp(time, s.startTime, s.endTime) - s.startTime) / Math.max(0.1, dur)) * 100}%` }} />
+            <button onClick={togglePlay} className="grid h-9 w-9 place-items-center rounded-full bg-white/10 hover:bg-white/20">
+              {playing ? <Pause className="h-4 w-4" /> : <Play className="ml-0.5 h-4 w-4" />}
+            </button>
+            <input
+              type="range"
+              className="slider flex-1"
+              min={s.startTime}
+              max={s.endTime}
+              step={0.05}
+              value={clamp(time, s.startTime, s.endTime)}
+              onChange={(e) => seek(Number(e.target.value))}
+              style={{ ["--p" as string]: `${((clamp(time, s.startTime, s.endTime) - s.startTime) / Math.max(0.1, dur)) * 100}%` }}
+            />
             <span className="w-20 text-right text-xs tabular-nums text-white/70">{formatTime(time, false)} / {Math.round(dur)}s</span>
           </div>
-          <p className="mt-3 text-[11px] text-white/50">9:16 · 1080 × 1920 · H.264 + AAC (MP4) · live composited preview</p>
+          <p className="mt-3 text-[11px] text-white/50">9:16 · 1080 × 1920 · live composited preview</p>
         </Card>
 
-        {/* Right: info + controls */}
+        {/* কনট্রোলস */}
         <div className="space-y-4">
           <Card className="p-5">
             <div className="flex items-center justify-between">
@@ -277,50 +321,132 @@ export function ShortEditor({ short: initial, video, moment, segments }: Props) 
             <Section title="Start / End">
               <div className="grid grid-cols-2 gap-3">
                 <Field label={`Start · ${formatTime(s.startTime)}`}>
-                  <input type="range" className="slider w-full" min={minT} max={s.endTime - 5} step={0.1} value={s.startTime} onChange={(e) => { update({ startTime: Number(e.target.value) }); seek(Number(e.target.value)); }} style={{ ["--p" as string]: `${((s.startTime - minT) / Math.max(0.1, s.endTime - 5 - minT)) * 100}%` }} />
+                  <input
+                    type="range"
+                    className="slider w-full"
+                    min={minT}
+                    max={s.endTime - 5}
+                    step={0.1}
+                    value={s.startTime}
+                    onChange={(e) => {
+                      update({ startTime: Number(e.target.value) });
+                      seek(Number(e.target.value));
+                    }}
+                    style={{ ["--p" as string]: `${((s.startTime - minT) / Math.max(0.1, s.endTime - 5 - minT)) * 100}%` }}
+                  />
                 </Field>
                 <Field label={`End · ${formatTime(s.endTime)}`}>
-                  <input type="range" className="slider w-full" min={s.startTime + 5} max={maxT} step={0.1} value={s.endTime} onChange={(e) => { update({ endTime: Number(e.target.value) }); seek(Number(e.target.value) - 0.5); }} style={{ ["--p" as string]: `${((s.endTime - s.startTime - 5) / Math.max(0.1, maxT - s.startTime - 5)) * 100}%` }} />
+                  <input
+                    type="range"
+                    className="slider w-full"
+                    min={s.startTime + 5}
+                    max={maxT}
+                    step={0.1}
+                    value={s.endTime}
+                    onChange={(e) => {
+                      update({ endTime: Number(e.target.value) });
+                      seek(Number(e.target.value) - 0.5);
+                    }}
+                    style={{ ["--p" as string]: `${((s.endTime - s.startTime - 5) / Math.max(0.1, maxT - s.startTime - 5)) * 100}%` }}
+                  />
                 </Field>
               </div>
               <div className="mt-2 flex gap-1.5 text-[11px]">
-                {[-1, -0.5, 0.5, 1].map((d) => <button key={"s" + d} onClick={() => update({ startTime: clamp(s.startTime + d, minT, s.endTime - 5) })} className="rounded-md border border-slate-200 px-2 py-0.5 hover:bg-slate-50">Start {d > 0 ? "+" : ""}{d}s</button>)}
-                {[-1, 1].map((d) => <button key={"e" + d} onClick={() => update({ endTime: clamp(s.endTime + d, s.startTime + 5, maxT) })} className="rounded-md border border-slate-200 px-2 py-0.5 hover:bg-slate-50">End {d > 0 ? "+" : ""}{d}s</button>)}
+                {[-1, -0.5, 0.5, 1].map((d) => (
+                  <button key={"s" + d} onClick={() => update({ startTime: clamp(s.startTime + d, minT, s.endTime - 5) })} className="rounded-md border border-slate-200 px-2 py-0.5 hover:bg-slate-50">
+                    Start {d > 0 ? "+" : ""}{d}s
+                  </button>
+                ))}
+                {[-1, 1].map((d) => (
+                  <button key={"e" + d} onClick={() => update({ endTime: clamp(s.endTime + d, s.startTime + 5, maxT) })} className="rounded-md border border-slate-200 px-2 py-0.5 hover:bg-slate-50">
+                    End {d > 0 ? "+" : ""}{d}s
+                  </button>
+                ))}
               </div>
             </Section>
 
             <Section title="Crop">
-              <Segmented size="sm" value={s.crop.layout} onChange={(v) => update({ crop: { ...s.crop, layout: v } })} options={[{ value: "fit", label: "Safe fit" }, { value: "top", label: "Top" }, { value: "fill", label: "Fill 9:16" }]} />
+              <Segmented
+                size="sm"
+                value={s.crop.layout}
+                onChange={(v) => update({ crop: { ...s.crop, layout: v } })}
+                options={[{ value: "fit", label: "Safe fit" }, { value: "top", label: "Top" }, { value: "fill", label: "Fill 9:16" }]}
+              />
               {s.crop.layout === "fill" ? (
                 <>
                   <p className="mt-2 text-[11px] text-amber-700">Fill crops the sides — burned-in subtitles may be cut. Pan horizontally:</p>
-                  <input type="range" className="slider mt-1 w-full" min={-1} max={1} step={0.01} value={s.crop.offsetX} onChange={(e) => update({ crop: { ...s.crop, offsetX: Number(e.target.value) } })} style={{ ["--p" as string]: `${((s.crop.offsetX + 1) / 2) * 100}%` }} />
+                  <input
+                    type="range"
+                    className="slider mt-1 w-full"
+                    min={-1}
+                    max={1}
+                    step={0.01}
+                    value={s.crop.offsetX}
+                    onChange={(e) => update({ crop: { ...s.crop, offsetX: Number(e.target.value) } })}
+                    style={{ ["--p" as string]: `${((s.crop.offsetX + 1) / 2) * 100}%` }}
+                  />
                 </>
               ) : (
                 <>
                   <p className="mt-2 text-[11px] text-slate-500">Full frame preserved (no subtitle loss). Vertical position:</p>
-                  <input type="range" className="slider mt-1 w-full" min={-1} max={1} step={0.01} value={s.crop.offsetY} onChange={(e) => update({ crop: { ...s.crop, offsetY: Number(e.target.value) } })} style={{ ["--p" as string]: `${((s.crop.offsetY + 1) / 2) * 100}%` }} />
+                  <input
+                    type="range"
+                    className="slider mt-1 w-full"
+                    min={-1}
+                    max={1}
+                    step={0.01}
+                    value={s.crop.offsetY}
+                    onChange={(e) => update({ crop: { ...s.crop, offsetY: Number(e.target.value) } })}
+                    style={{ ["--p" as string]: `${((s.crop.offsetY + 1) / 2) * 100}%` }}
+                  />
                 </>
               )}
             </Section>
 
             <Section title={`Zoom · ${s.zoom.toFixed(2)}×`}>
-              <input type="range" className="slider w-full" min={0.85} max={1.4} step={0.01} value={s.zoom} onChange={(e) => update({ zoom: Number(e.target.value) })} style={{ ["--p" as string]: `${((s.zoom - 0.85) / 0.55) * 100}%` }} />
+              <input
+                type="range"
+                className="slider w-full"
+                min={0.85}
+                max={1.4}
+                step={0.01}
+                value={s.zoom}
+                onChange={(e) => update({ zoom: Number(e.target.value) })}
+                style={{ ["--p" as string]: `${((s.zoom - 0.85) / 0.55) * 100}%` }}
+              />
             </Section>
 
             <Section title="Motion">
               <div className="flex flex-wrap gap-1.5">
-                {MOTION_OPTIONS.map((m) => <Chip key={m.id} active={s.motion === m.id} onClick={() => update({ motion: m.id })}>{m.label}</Chip>)}
+                {MOTION_OPTIONS.map((m) => (
+                  <Chip key={m.id} active={s.motion === m.id} onClick={() => update({ motion: m.id })}>
+                    {m.label}
+                  </Chip>
+                ))}
               </div>
             </Section>
 
             <Section title="Subtitle">
               <div className="flex flex-wrap gap-1.5">
-                {SUBTITLE_MODES.map((m) => <Chip key={m.id} active={s.subtitleMode === m.id} onClick={() => update({ subtitleMode: m.id })}>{m.label}</Chip>)}
+                {SUBTITLE_MODES.map((m) => (
+                  <Chip key={m.id} active={s.subtitleMode === m.id} onClick={() => update({ subtitleMode: m.id })}>
+                    {m.label}
+                  </Chip>
+                ))}
               </div>
               <div className="no-scrollbar mt-3 flex gap-2 overflow-x-auto pb-1">
                 {CAPTION_TEMPLATES.map((t) => (
-                  <button key={t.id} onClick={() => update({ template: t.id })} className={cn("shrink-0 rounded-lg border px-2.5 py-1.5 text-[11px] font-semibold", s.template === t.id ? "border-brand-500 bg-brand-50 text-brand-700" : "border-slate-200 text-slate-600")} style={{ borderLeftColor: t.accent, borderLeftWidth: 3 }}>{t.name}</button>
+                  <button
+                    key={t.id}
+                    onClick={() => update({ template: t.id })}
+                    className={cn(
+                      "shrink-0 rounded-lg border px-2.5 py-1.5 text-[11px] font-semibold",
+                      s.template === t.id ? "border-brand-500 bg-brand-50 text-brand-700" : "border-slate-200 text-slate-600"
+                    )}
+                    style={{ borderLeftColor: t.accent, borderLeftWidth: 3 }}
+                  >
+                    {t.name}
+                  </button>
                 ))}
               </div>
             </Section>
@@ -328,7 +454,11 @@ export function ShortEditor({ short: initial, video, moment, segments }: Props) 
             <Section title="Hook">
               <input value={s.hook} onChange={(e) => update({ hook: e.target.value })} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-brand-400 focus:outline-none" />
               <div className="mt-2 flex flex-wrap gap-1.5">
-                {(HOOK_LIBRARY[s.category] ?? HOOK_LIBRARY.default).map((h) => <Chip key={h} active={s.hook === h} onClick={() => update({ hook: h })}>{h}</Chip>)}
+                {(HOOK_LIBRARY[s.category] ?? HOOK_LIBRARY.default).map((h) => (
+                  <Chip key={h} active={s.hook === h} onClick={() => update({ hook: h })}>
+                    {h}
+                  </Chip>
+                ))}
               </div>
             </Section>
 
@@ -364,6 +494,7 @@ function Row({ k, v }: { k: string; v: string }) {
     </div>
   );
 }
+
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div className="p-4">
@@ -372,6 +503,7 @@ function Section({ title, children }: { title: string; children: React.ReactNode
     </div>
   );
 }
+
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="block">
@@ -380,6 +512,7 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
     </label>
   );
 }
+
 function Chip({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
   return (
     <button onClick={onClick} className={cn("rounded-full border px-2.5 py-1 text-[11px] font-semibold transition", active ? "border-brand-500 bg-brand-500 text-white" : "border-slate-200 bg-white text-slate-700 hover:border-brand-300")}>
