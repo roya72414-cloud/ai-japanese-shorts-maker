@@ -79,6 +79,7 @@ export function ShortEditor({ short: initial, video, moment, segments }: Props) 
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
+    v.muted = false; // অডিও নিশ্চিতভাবে চালু রাখার জন্য
     const onReady = () => {
       v.currentTime = s.startTime;
     };
@@ -115,9 +116,17 @@ export function ShortEditor({ short: initial, video, moment, segments }: Props) 
       v.pause();
       setPlaying(false);
     } else {
-      if (v.currentTime < s.startTime || v.currentTime >= s.endTime - 0.05) v.currentTime = s.startTime;
-      await v.play();
-      setPlaying(true);
+      try {
+        v.muted = false;
+        if (v.currentTime < s.startTime || v.currentTime >= s.endTime - 0.05) v.currentTime = s.startTime;
+        await v.play();
+        setPlaying(true);
+      } catch {
+        // ব্রাউজার অডিও পলিসি ফলব্যাক
+        v.muted = true;
+        await v.play();
+        setPlaying(true);
+      }
     }
   };
 
@@ -148,16 +157,46 @@ export function ShortEditor({ short: initial, video, moment, segments }: Props) 
     setExportProgress(0);
     try {
       if (dirty) await save();
-      await fetch(`/api/shorts/${s.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "rendering", progress: 0 }) });
+      
+      // ব্যাকগ্রাউন্ডে স্টেট নোটিফাই করা
+      fetch(`/api/shorts/${s.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "rendering", progress: 0 }) }).catch(() => {});
       setS((p) => ({ ...p, status: "rendering" }));
+
+      // ব্রাউজারে ভিডিও রেন্ডার সম্পন্ন করা
       const result = await renderShort(src, opts, (p) => setExportProgress(Math.round(p * 100)));
-      const up = await fetch(`/api/shorts/${s.id}/render?format=${result.format}`, { method: "POST", body: result.blob, headers: { "Content-Type": result.mime } });
-      const row = (await up.json()) as Short;
-      setS((p) => ({ ...p, ...row }));
-      router.refresh();
+
+      // সরাসরি ব্রাউজার মেমোরিতে অবজেক্ট URL তৈরি
+      const localBlobUrl = URL.createObjectURL(result.blob);
+
+      // কোনো সার্ভারলেস 413 এরর ছাড়াই স্বয়ংক্রিয়ভাবে ভিডিও ডাউনলোড ট্রিগার করা
+      const a = document.createElement("a");
+      a.href = localBlobUrl;
+      a.download = `${video.name || "short"}-${s.id}.${result.format}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+
+      // সফল হিসেবে স্টেট আপডেট
+      const completedShort = {
+        ...s,
+        outputPath: localBlobUrl,
+        outputFormat: result.format,
+        outputSize: result.blob.size,
+        status: "complete" as const,
+        progress: 100,
+      };
+      setS(completedShort);
+
+      // সার্ভারকে মেটাডেটা আপডেট পাঠানো
+      fetch(`/api/shorts/${s.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "complete", progress: 100, outputFormat: result.format, outputSize: result.blob.size }),
+      }).catch(() => {});
+
     } catch (e) {
       setError(e instanceof Error ? e.message : "Export failed");
-      await fetch(`/api/shorts/${s.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "failed" }) });
+      fetch(`/api/shorts/${s.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "failed" }) }).catch(() => {});
       setS((p) => ({ ...p, status: "failed" }));
     } finally {
       setExporting(false);
