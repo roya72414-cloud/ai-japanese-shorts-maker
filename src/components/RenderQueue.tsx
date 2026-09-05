@@ -28,10 +28,6 @@ async function loadVideoContext(videoId: number) {
   return ctx;
 }
 
-/**
- * Processes shorts with status "waiting" one at a time: renders in-browser to
- * 1080x1920, uploads directly to Supabase Storage, then updates database.
- */
 export function useRenderQueue(items: QueueShort[], onUpdate: (s: Short) => void, enabled = true) {
   const [activeId, setActiveId] = useState<number | null>(null);
   const [tick, setTick] = useState(0);
@@ -81,43 +77,49 @@ export function useRenderQueue(items: QueueShort[], onUpdate: (s: Short) => void
           (p) => setProgress(Math.round(p * 100)),
         );
 
-        // Vercel সার্ভার বাইপাস করে সরাসরি Supabase Storage REST API-তে আপলোড
-        const supabaseUrl =
-          process.env.NEXT_PUBLIC_SUPABASE_URL ||
-          "https://ylebzdcglqdbkobhsqkw.supabase.co";
-        const supabaseKey =
-          process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
-          "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlsZWJ6ZGNnbHFkYmtvYmhzcWt3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDEyODE0NzYsImV4cCI6MjA1Njg1NzQ3Nn0.8m1oN_rYQp7i2u_WzZc5t0D7h_9E4c5L3w8v7b6a1Z4";
+        // সার্ভার থেকে নিরাপদ Signed Upload URL নিয়ে আসা
+        const ticketRes = await fetch(`/api/shorts/${s.id}/render?format=${result.format}`);
+        if (!ticketRes.ok) {
+          throw new Error("Could not initialize upload destination");
+        }
+        const { uploadUrl, storagePath } = await ticketRes.json();
 
-        const fileName = `short-${s.id}-${Date.now()}.${result.format}`;
-        const storagePath = `renders/${fileName}`;
-        const targetUrl = `${supabaseUrl.replace(/\/$/, "")}/storage/v1/object/videos/${storagePath}`;
-
-        const up = await fetch(targetUrl, {
-          method: "POST",
+        // সরাসরি Supabase-এ বাইনারি আপলোড করা
+        const up = await fetch(uploadUrl, {
+          method: "PUT",
           headers: {
-            "Authorization": `Bearer ${supabaseKey}`,
-            "apikey": supabaseKey,
             "Content-Type": result.mime,
-            "x-upsert": "true",
           },
           body: result.blob,
         });
 
         if (!up.ok) {
-          const errText = await up.text();
-          throw new Error(errText || "Storage upload failed");
+          // PUT ফেইল করলে POST ট্রাই করা
+          const postUp = await fetch(uploadUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": result.mime,
+            },
+            body: result.blob,
+          });
+          if (!postUp.ok) {
+            const errText = await postUp.text();
+            throw new Error(errText || "Direct storage upload failed");
+          }
         }
 
-        // ডাটাবেজে ফাইল পাথ ও কমপ্লিট স্ট্যাটাস আপডেট
-        const updatedRow = await mark({
-          outputPath: storagePath,
-          outputFormat: result.format,
-          outputSize: result.blob.size,
-          status: "complete",
-          progress: 100,
+        // আপলোড সম্পন্ন হওয়া ডাটাবেজে কনফার্ম করা
+        const finishRes = await fetch(`/api/shorts/${s.id}/render`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            storagePath,
+            format: result.format,
+            size: result.blob.size,
+          }),
         });
 
+        const updatedRow = (await finishRes.json()) as Short;
         onUpdate(updatedRow);
       } catch (e) {
         const raw = e instanceof Error ? e.message : "Render failed";
