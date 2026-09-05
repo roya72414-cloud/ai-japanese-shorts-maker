@@ -36,7 +36,7 @@ function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: numbe
   ctx.arcTo(x + w, y, x + w, y + h, rr);
   ctx.arcTo(x + w, y + h, x, y + h, rr);
   ctx.arcTo(x, y + h, x, y, rr);
-  ctx.arcTo(x, y, x + w, y, rr);
+  ctx.arcTo(x, y + x, y, rr);
   ctx.closePath();
 }
 
@@ -71,7 +71,6 @@ function easeInOut(t: number) {
   return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
 }
 
-/** Computes motion transform (scale, pan) at normalized progress p (0..1). */
 function motionAt(motion: string, p: number) {
   const e = easeInOut(Math.min(1, Math.max(0, p)));
   switch (motion) {
@@ -94,8 +93,8 @@ export class ShortComposer {
   constructor(public opts: RenderOptions) {
     this.template = getTemplate(opts.templateId);
     this.bgCanvas = document.createElement("canvas");
-    this.bgCanvas.width = 135;
-    this.bgCanvas.height = 240;
+    this.bgCanvas.width = 270;
+    this.bgCanvas.height = 480;
     this.bgCtx = this.bgCanvas.getContext("2d")!;
   }
 
@@ -119,7 +118,6 @@ export class ShortComposer {
     const { crop, zoom } = this.opts;
     const aspect = vw / vh;
     if (crop.layout === "fill") {
-      // Center crop to 9:16 (may cut sides). Zoom + offset pan.
       const h = OUT_H * zoom * fgScale;
       const w = h * aspect;
       const x = (OUT_W - w) / 2 + crop.offsetX * Math.max(0, (w - OUT_W) / 2);
@@ -139,11 +137,11 @@ export class ShortComposer {
     const p = (time - startTime) / Math.max(0.1, endTime - startTime);
     const m = motionAt(motion, p);
 
-    // 1. Background: blurred, slowly moving source frame under a template tint
+    // 1. Background Blur
     ctx.fillStyle = t.bg;
     ctx.fillRect(0, 0, OUT_W, OUT_H);
     const bc = this.bgCtx;
-    bc.filter = "blur(6px)";
+    bc.filter = "blur(12px)";
     const vw = "videoWidth" in video ? video.videoWidth || 16 : video.width;
     const vh = "videoHeight" in video ? video.videoHeight || 9 : video.height;
     const coverScale = Math.max(this.bgCanvas.width / vw, this.bgCanvas.height / vh) * m.scale;
@@ -158,6 +156,7 @@ export class ShortComposer {
     );
     bc.filter = "none";
     ctx.drawImage(this.bgCanvas, 0, 0, OUT_W, OUT_H);
+
     const grad = ctx.createLinearGradient(0, 0, 0, OUT_H);
     grad.addColorStop(0, hexToRgba(t.bg, 0.78));
     grad.addColorStop(0.5, hexToRgba(t.bg2, 0.55));
@@ -165,10 +164,10 @@ export class ShortComposer {
     ctx.fillStyle = grad;
     ctx.fillRect(0, 0, OUT_W, OUT_H);
 
-    // 2. Foreground video (subtitle-safe: never cropped in "fit" layout)
+    // 2. Foreground Video Frame
     const fg = this.foregroundLayout(video, m.fgScale);
     ctx.save();
-    ctx.shadowColor = "rgba(0,0,0,0.5)";
+    ctx.shadowColor = "rgba(0,0,0,0.55)";
     ctx.shadowBlur = 40;
     ctx.shadowOffsetY = 16;
     if (this.opts.crop.layout !== "fill") {
@@ -181,7 +180,7 @@ export class ShortComposer {
     ctx.drawImage(video, fg.x, fg.y, fg.w, fg.h);
     ctx.restore();
 
-    // 3. Badge (template / level)
+    // 3. Badge (JLPT / Category)
     const badge = this.opts.level ? `JLPT ${this.opts.level}` : t.badge;
     if (badge) {
       ctx.save();
@@ -196,10 +195,10 @@ export class ShortComposer {
       ctx.restore();
     }
 
-    // 4. Hook card above the video
+    // 4. Hook Card
     if (hook) {
       ctx.save();
-      ctx.font = `${t.weight} 58px ${t.jaFont}`;
+      ctx.font = `${t.weight} 56px ${t.jaFont}`;
       const lines = wrapText(ctx, hook, OUT_W - 200);
       const lineH = 72;
       const boxH = lines.length * lineH + 40;
@@ -217,8 +216,7 @@ export class ShortComposer {
       ctx.restore();
     }
 
-    // 5. Generated captions — skipped entirely in "preserve" mode so burned-in
-    //    subtitles are never duplicated. Drawn in the panel BELOW the video.
+    // 5. Generated Captions
     if (subtitleMode !== "preserve") {
       const seg = this.currentSegment(time);
       if (seg) {
@@ -230,11 +228,10 @@ export class ShortComposer {
         ctx.textBaseline = "top";
         const maxW = OUT_W - 140;
         let y = fg.y + fg.h + 70;
-        // Japanese line
+
         ctx.font = `${t.weight} ${t.jaSize}px ${t.jaFont}`;
         const jaLines = wrapText(ctx, seg.ja, maxW);
         if (preserveBurnedSubtitles && subtitleMode === "ja") {
-          // If burned subtitles already include Japanese we still draw (user asked), but smaller.
           ctx.font = `${t.weight} ${Math.round(t.jaSize * 0.85)}px ${t.jaFont}`;
         }
         if (t.id === "vocabulary" || t.id === "conversation") {
@@ -276,7 +273,7 @@ export class ShortComposer {
       }
     }
 
-    // 6. Progress bar
+    // 6. Progress Bar
     if (this.opts.showProgress !== false) {
       ctx.fillStyle = "rgba(255,255,255,0.18)";
       ctx.fillRect(0, OUT_H - 10, OUT_W, 10);
@@ -309,11 +306,6 @@ export function pickRecorderMime(): { mime: string; format: "mp4" | "webm" } | n
   return null;
 }
 
-/**
- * Renders a Short to a video Blob by playing the source segment in a hidden
- * element, compositing frames to a 1080x1920 canvas, and recording the canvas
- * stream together with the original Japanese audio.
- */
 export async function renderShort(
   sourceUrl: string,
   opts: RenderOptions,
@@ -327,19 +319,22 @@ export async function renderShort(
   video.crossOrigin = "anonymous";
   video.preload = "auto";
   video.playsInline = true;
+  video.muted = false;
   video.src = sourceUrl;
+
   await new Promise<void>((res, rej) => {
     video.onloadedmetadata = () => res();
-    video.onerror = () => rej(new Error("Could not load source video"));
+    video.onerror = () => rej(new Error("Could not load source video metadata"));
   });
 
   const canvas = document.createElement("canvas");
   canvas.width = OUT_W;
   canvas.height = OUT_H;
-  const ctx = canvas.getContext("2d")!;
+  const ctx = canvas.getContext("2d", { alpha: false, desynchronized: false })!;
   const composer = new ShortComposer(opts);
 
-  const ac = new AudioContext();
+  // অডিও নোড বাইন্ড
+  const ac = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
   const srcNode = ac.createMediaElementSource(video);
   const dest = ac.createMediaStreamDestination();
   srcNode.connect(dest);
@@ -347,21 +342,29 @@ export async function renderShort(
   const stream = canvas.captureStream(fps);
   for (const track of dest.stream.getAudioTracks()) stream.addTrack(track);
 
+  // 16 Mbps হাই-কোয়ালিটি বিটরেট (কোনো ব্লার বা পিক্সেল ফাটা থাকবে না)
   const recorder = new MediaRecorder(stream, {
     mimeType: rec.mime,
-    videoBitsPerSecond: 8_000_000,
-    audioBitsPerSecond: 160_000,
+    videoBitsPerSecond: 16_000_000,
+    audioBitsPerSecond: 192_000,
   });
+
   const chunks: BlobPart[] = [];
   recorder.ondataavailable = (e) => {
     if (e.data.size) chunks.push(e.data);
   };
 
+  // ১. এক্স্যাক্ট টাইমে সিক হওয়া সম্পূর্ণ কনফার্ম করা
   await new Promise<void>((res) => {
+    const handleSeeked = () => {
+      video.removeEventListener("seeked", handleSeeked);
+      res();
+    };
+    video.addEventListener("seeked", handleSeeked);
     video.currentTime = opts.startTime;
-    video.onseeked = () => res();
-    setTimeout(res, 2000);
   });
+
+  // প্রথম ফ্রেম নিখুঁতভাবে ক্যানভাসে ড্র করা
   composer.draw(ctx, video, opts.startTime);
 
   const done = new Promise<Blob>((res) => {
@@ -369,15 +372,21 @@ export async function renderShort(
   });
 
   await ac.resume();
-  recorder.start(500);
+  recorder.start(100);
   await video.play();
 
+  const totalDuration = Math.max(0.1, opts.endTime - opts.startTime);
+
+  // ২. ফ্রেম বাই ফ্রেম এক্স্যাক্ট টাইমিং রেন্ডার লুপ
   await new Promise<void>((res) => {
     let raf = 0;
     const tick = () => {
       const t = video.currentTime;
       composer.draw(ctx, video, t);
-      onProgress?.(Math.min(1, (t - opts.startTime) / Math.max(0.1, opts.endTime - opts.startTime)));
+
+      const elapsed = Math.max(0, t - opts.startTime);
+      onProgress?.(Math.min(0.99, elapsed / totalDuration));
+
       if (t >= opts.endTime || video.ended) {
         cancelAnimationFrame(raf);
         video.pause();
@@ -391,8 +400,11 @@ export async function renderShort(
 
   recorder.stop();
   const blob = await done;
+
   srcNode.disconnect();
   await ac.close();
   video.src = "";
+
+  if (onProgress) onProgress(1);
   return { blob, format: rec.format, mime: rec.mime };
 }
