@@ -49,6 +49,14 @@ export function Studio({ video: initialVideo, moments: initialMoments, shorts: i
 
   const src = fileUrl(video.storagePath);
 
+  // ভিডিও লোড হলে অডিও নিশ্চিতভাবে আনমিউট করা
+  useEffect(() => {
+    const v = mainVideoRef.current;
+    if (!v) return;
+    v.muted = false;
+    v.volume = 1.0;
+  }, [src]);
+
   // Auto-select applies whenever controls change
   useEffect(() => {
     setSelected(new Set(applyAutoSelect(moments, auto).map((m) => m.id)));
@@ -182,7 +190,20 @@ export function Studio({ video: initialVideo, moments: initialMoments, shorts: i
           <Card className="overflow-hidden">
             <div className="grid grid-cols-1 lg:grid-cols-[1.5fr_1fr]">
               <div className="relative aspect-video bg-ink-900">
-                <video ref={mainVideoRef} src={src} poster={fileUrl(video.thumbnailPath)} controls className="h-full w-full" onTimeUpdate={(e) => setPlayhead(e.currentTarget.currentTime)} />
+                <video
+                  ref={mainVideoRef}
+                  src={src}
+                  poster={fileUrl(video.thumbnailPath)}
+                  controls
+                  playsInline
+                  crossOrigin="anonymous"
+                  className="h-full w-full"
+                  onTimeUpdate={(e) => setPlayhead(e.currentTarget.currentTime)}
+                  onPlay={(e) => {
+                    e.currentTarget.muted = false;
+                    e.currentTarget.volume = 1.0;
+                  }}
+                />
               </div>
               <div className="flex flex-col p-5">
                 <div className="flex items-start justify-between gap-3">
@@ -375,8 +396,14 @@ export function Studio({ video: initialVideo, moments: initialMoments, shorts: i
                 src={`${src}#t=${previewMoment.startTime},${previewMoment.endTime}`}
                 controls
                 autoPlay
+                playsInline
+                crossOrigin="anonymous"
                 className="aspect-video w-full rounded-xl bg-black"
                 onTimeUpdate={(e) => { if (e.currentTarget.currentTime >= previewMoment.endTime) e.currentTarget.pause(); }}
+                onPlay={(e) => {
+                  e.currentTarget.muted = false;
+                  e.currentTarget.volume = 1.0;
+                }}
               />
               <div className="mt-2 flex items-center justify-between text-xs text-slate-500">
                 <span className="tabular-nums">{formatTime(previewMoment.startTime)} — {formatTime(previewMoment.endTime)} · {Math.round(previewMoment.endTime - previewMoment.startTime)}s</span>
