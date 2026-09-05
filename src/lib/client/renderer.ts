@@ -137,7 +137,7 @@ export class ShortComposer {
     const p = (time - startTime) / Math.max(0.1, endTime - startTime);
     const m = motionAt(motion, p);
 
-    // 1. Background Blur
+    // ১. ব্যাকগ্রাউন্ড ব্লার
     ctx.fillStyle = t.bg;
     ctx.fillRect(0, 0, OUT_W, OUT_H);
     const bc = this.bgCtx;
@@ -164,7 +164,7 @@ export class ShortComposer {
     ctx.fillStyle = grad;
     ctx.fillRect(0, 0, OUT_W, OUT_H);
 
-    // 2. Foreground Video Frame
+    // ২. মূল ভিডিও ফ্রেম
     const fg = this.foregroundLayout(video, m.fgScale);
     ctx.save();
     ctx.shadowColor = "rgba(0,0,0,0.55)";
@@ -180,7 +180,7 @@ export class ShortComposer {
     ctx.drawImage(video, fg.x, fg.y, fg.w, fg.h);
     ctx.restore();
 
-    // 3. Badge
+    // ৩. ব্যাজ
     const badge = this.opts.level ? `JLPT ${this.opts.level}` : t.badge;
     if (badge) {
       ctx.save();
@@ -195,7 +195,7 @@ export class ShortComposer {
       ctx.restore();
     }
 
-    // 4. Hook Card
+    // ৪. হুক কার্ড
     if (hook) {
       ctx.save();
       ctx.font = `${t.weight} 56px ${t.jaFont}`;
@@ -216,7 +216,7 @@ export class ShortComposer {
       ctx.restore();
     }
 
-    // 5. Captions
+    // ৫. সাবটাইটেল
     if (subtitleMode !== "preserve") {
       const seg = this.currentSegment(time);
       if (seg) {
@@ -273,7 +273,7 @@ export class ShortComposer {
       }
     }
 
-    // 6. Progress Bar
+    // ৬. প্রগ্রেস বার
     if (this.opts.showProgress !== false) {
       ctx.fillStyle = "rgba(255,255,255,0.18)";
       ctx.fillRect(0, OUT_H - 10, OUT_W, 10);
@@ -315,12 +315,21 @@ export async function renderShort(
   const rec = pickRecorderMime();
   if (!rec) throw new Error("This browser cannot record video. Please use Chrome or Edge.");
 
+  // ভিডিও যাতে ব্রাউজার অপ্টিমাইজেশনের কারণে ব্যাকগ্রাউন্ডে ফ্রিজ না হয়, তাই দৃশ্যমান ডক নোডে অ্যাক্টিভ রাখা
   const video = document.createElement("video");
   video.crossOrigin = "anonymous";
   video.preload = "auto";
   video.playsInline = true;
   video.muted = false;
   video.src = sourceUrl;
+  video.style.position = "fixed";
+  video.style.top = "-9999px";
+  video.style.left = "-9999px";
+  video.style.width = "320px";
+  video.style.height = "180px";
+  video.style.opacity = "0.01";
+  video.style.pointerEvents = "none";
+  document.body.appendChild(video);
 
   await new Promise<void>((res, rej) => {
     video.onloadedmetadata = () => res();
@@ -330,7 +339,7 @@ export async function renderShort(
   const canvas = document.createElement("canvas");
   canvas.width = OUT_W;
   canvas.height = OUT_H;
-  const ctx = canvas.getContext("2d", { alpha: false, desynchronized: false })!;
+  const ctx = canvas.getContext("2d", { alpha: false })!;
   const composer = new ShortComposer(opts);
 
   const ac = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
@@ -373,24 +382,22 @@ export async function renderShort(
 
   const totalDuration = Math.max(0.1, opts.endTime - opts.startTime);
 
+  // ইন্টারভাল লুপ ব্যবহার করায় ব্রাউজার প্রতিটি ফ্রেম ড্র নিশ্চিত করবে (ভিডিও ফ্রিজ হবে না)
   await new Promise<void>((res) => {
-    let raf = 0;
-    const tick = () => {
+    const intervalTime = 1000 / fps;
+    const interval = setInterval(() => {
       const t = video.currentTime;
       composer.draw(ctx, video, t);
 
       const elapsed = Math.max(0, t - opts.startTime);
       onProgress?.(Math.min(0.99, elapsed / totalDuration));
 
-      if (t >= opts.endTime || video.ended) {
-        cancelAnimationFrame(raf);
+      if (t >= opts.endTime || video.ended || video.paused) {
+        clearInterval(interval);
         video.pause();
         res();
-        return;
       }
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
+    }, intervalTime);
   });
 
   recorder.stop();
@@ -398,6 +405,7 @@ export async function renderShort(
 
   srcNode.disconnect();
   await ac.close();
+  if (video.parentNode) video.parentNode.removeChild(video);
   video.src = "";
 
   if (onProgress) onProgress(1);
