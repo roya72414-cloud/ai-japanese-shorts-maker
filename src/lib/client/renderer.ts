@@ -12,8 +12,8 @@ export type RenderOptions = {
   templateId: string;
   subtitleMode: SubtitleMode | string;
   crop: CropSettings;
-  zoom: number; // 1..1.3 user zoom on top of motion
-  motion: string; // ken-burns | slow-pan | subtle-scale | none
+  zoom: number;
+  motion: string;
   hook: string;
   segments: TranscriptSegment[];
   subtitleArea?: SubtitleArea | null;
@@ -36,7 +36,7 @@ function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: numbe
   ctx.arcTo(x + w, y, x + w, y + h, rr);
   ctx.arcTo(x + w, y + h, x, y + h, rr);
   ctx.arcTo(x, y + h, x, y, rr);
-  ctx.arcTo(x, y + x, y, rr);
+  ctx.arcTo(x, y, x + w, y, rr);
   ctx.closePath();
 }
 
@@ -180,7 +180,7 @@ export class ShortComposer {
     ctx.drawImage(video, fg.x, fg.y, fg.w, fg.h);
     ctx.restore();
 
-    // 3. Badge (JLPT / Category)
+    // 3. Badge
     const badge = this.opts.level ? `JLPT ${this.opts.level}` : t.badge;
     if (badge) {
       ctx.save();
@@ -216,7 +216,7 @@ export class ShortComposer {
       ctx.restore();
     }
 
-    // 5. Generated Captions
+    // 5. Captions
     if (subtitleMode !== "preserve") {
       const seg = this.currentSegment(time);
       if (seg) {
@@ -333,7 +333,6 @@ export async function renderShort(
   const ctx = canvas.getContext("2d", { alpha: false, desynchronized: false })!;
   const composer = new ShortComposer(opts);
 
-  // অডিও নোড বাইন্ড
   const ac = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
   const srcNode = ac.createMediaElementSource(video);
   const dest = ac.createMediaStreamDestination();
@@ -342,7 +341,6 @@ export async function renderShort(
   const stream = canvas.captureStream(fps);
   for (const track of dest.stream.getAudioTracks()) stream.addTrack(track);
 
-  // 16 Mbps হাই-কোয়ালিটি বিটরেট (কোনো ব্লার বা পিক্সেল ফাটা থাকবে না)
   const recorder = new MediaRecorder(stream, {
     mimeType: rec.mime,
     videoBitsPerSecond: 16_000_000,
@@ -354,7 +352,6 @@ export async function renderShort(
     if (e.data.size) chunks.push(e.data);
   };
 
-  // ১. এক্স্যাক্ট টাইমে সিক হওয়া সম্পূর্ণ কনফার্ম করা
   await new Promise<void>((res) => {
     const handleSeeked = () => {
       video.removeEventListener("seeked", handleSeeked);
@@ -364,7 +361,6 @@ export async function renderShort(
     video.currentTime = opts.startTime;
   });
 
-  // প্রথম ফ্রেম নিখুঁতভাবে ক্যানভাসে ড্র করা
   composer.draw(ctx, video, opts.startTime);
 
   const done = new Promise<Blob>((res) => {
@@ -377,7 +373,6 @@ export async function renderShort(
 
   const totalDuration = Math.max(0.1, opts.endTime - opts.startTime);
 
-  // ২. ফ্রেম বাই ফ্রেম এক্স্যাক্ট টাইমিং রেন্ডার লুপ
   await new Promise<void>((res) => {
     let raf = 0;
     const tick = () => {
