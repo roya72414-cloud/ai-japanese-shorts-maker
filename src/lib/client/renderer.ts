@@ -62,35 +62,11 @@ function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number)
   return lines;
 }
 
-function easeInOut(t: number) {
-  return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
-}
-
-function motionAt(motion: string, p: number) {
-  const e = easeInOut(Math.min(1, Math.max(0, p)));
-  switch (motion) {
-    case "ken-burns":
-      return { scale: 1 + 0.06 * e, dx: -0.015 * e, dy: 0.01 * e, fgScale: 0.975 + 0.025 * e };
-    case "slow-pan":
-      return { scale: 1.06, dx: -0.03 + 0.06 * e, dy: 0, fgScale: 0.985 + 0.015 * e };
-    case "subtle-scale":
-      return { scale: 1 + 0.03 * Math.sin(p * Math.PI), dx: 0, dy: 0, fgScale: 0.985 + 0.015 * Math.sin(p * Math.PI) };
-    default:
-      return { scale: 1.02, dx: 0, dy: 0, fgScale: 1 };
-  }
-}
-
 export class ShortComposer {
-  private bgCanvas: HTMLCanvasElement;
-  private bgCtx: CanvasRenderingContext2D;
   template: CaptionTemplate;
 
   constructor(public opts: RenderOptions) {
     this.template = getTemplate(opts.templateId);
-    this.bgCanvas = document.createElement("canvas");
-    this.bgCanvas.width = 270;
-    this.bgCanvas.height = 480;
-    this.bgCtx = this.bgCanvas.getContext("2d")!;
   }
 
   setOptions(opts: Partial<RenderOptions>) {
@@ -107,60 +83,67 @@ export class ShortComposer {
     return best;
   }
 
-  private foregroundLayout(video: HTMLVideoElement | HTMLCanvasElement, fgScale: number): Layout {
+  // রিলসের জন্য সঠিক বড় ও সুন্দর ভিডিও সাইজ
+  private foregroundLayout(video: HTMLVideoElement | HTMLCanvasElement): Layout {
     const vw = "videoWidth" in video ? video.videoWidth || 16 : video.width;
     const vh = "videoHeight" in video ? video.videoHeight || 9 : video.height;
     const { crop, zoom } = this.opts;
     const aspect = vw / vh;
+
     if (crop.layout === "fill") {
-      const h = OUT_H * zoom * fgScale;
+      const h = OUT_H * Math.max(1, zoom);
       const w = h * aspect;
-      const x = (OUT_W - w) / 2 + crop.offsetX * Math.max(0, (w - OUT_W) / 2);
+      const x = (OUT_W - w) / 2 + (crop.offsetX || 0) * Math.max(0, (w - OUT_W) / 2);
       const y = (OUT_H - h) / 2;
       return { x, y, w, h };
     }
-    const w = OUT_W * Math.min(1, zoom) * fgScale;
+
+    // ফুল-স্ক্রিন প্রিমিয়াম রিলস ফ্রেম (চওড়ায় ১০২০ পিক্সেল পর্যন্ত বড় থাকবে)
+    const w = (OUT_W - 40) * Math.min(1.15, Math.max(0.95, zoom));
     const h = w / aspect;
-    const centerY = crop.layout === "top" ? OUT_H * 0.36 : OUT_H * 0.47;
-    const y = centerY - h / 2 + crop.offsetY * OUT_H * 0.12;
+    const centerY = crop.layout === "top" ? OUT_H * 0.40 : OUT_H * 0.48;
+    const y = centerY - h / 2 + (crop.offsetY || 0) * OUT_H * 0.15;
     return { x: (OUT_W - w) / 2, y, w, h };
   }
 
   draw(ctx: CanvasRenderingContext2D, video: HTMLVideoElement | HTMLCanvasElement, time: number) {
-    const { startTime, endTime, motion, hook, subtitleMode, preserveBurnedSubtitles } = this.opts;
+    const { startTime, endTime, hook, subtitleMode, preserveBurnedSubtitles } = this.opts;
     const t = this.template;
     const p = (time - startTime) / Math.max(0.1, endTime - startTime);
-    const m = motionAt(motion, p);
 
-    // ১. ব্যাকগ্রাউন্ড ব্লার
-    ctx.fillStyle = t.bg;
-    ctx.fillRect(0, 0, OUT_W, OUT_H);
-    const bc = this.bgCtx;
-    bc.filter = "blur(12px)";
     const vw = "videoWidth" in video ? video.videoWidth || 16 : video.width;
     const vh = "videoHeight" in video ? video.videoHeight || 9 : video.height;
-    const coverScale = Math.max(this.bgCanvas.width / vw, this.bgCanvas.height / vh) * m.scale;
-    const bw = vw * coverScale;
-    const bh = vh * coverScale;
-    bc.drawImage(video, (this.bgCanvas.width - bw) / 2 + m.dx * this.bgCanvas.width, (this.bgCanvas.height - bh) / 2 + m.dy * this.bgCanvas.height, bw, bh);
-    bc.filter = "none";
-    ctx.drawImage(this.bgCanvas, 0, 0, OUT_W, OUT_H);
 
+    // ১. ব্যাকগ্রাউন্ড: পুরো ৯:১৬ স্ক্রিন জুড়ে ভাইব্র্যান্ট ও স্মুথ ব্লার
+    ctx.save();
+    ctx.fillStyle = t.bg || "#0f172a";
+    ctx.fillRect(0, 0, OUT_W, OUT_H);
+
+    ctx.filter = "blur(35px) brightness(0.65)";
+    const bgScale = Math.max(OUT_W / vw, OUT_H / vh) * 1.15;
+    const bgW = vw * bgScale;
+    const bgH = vh * bgScale;
+    ctx.drawImage(video, (OUT_W - bgW) / 2, (OUT_H - bgH) / 2, bgW, bgH);
+    ctx.restore();
+
+    // গ্রাডিয়েন্ট শেইড যাতে টেক্সট ক্রিস্প দেখায়
     const grad = ctx.createLinearGradient(0, 0, 0, OUT_H);
-    grad.addColorStop(0, hexToRgba(t.bg, 0.78));
-    grad.addColorStop(0.5, hexToRgba(t.bg2, 0.55));
-    grad.addColorStop(1, hexToRgba(t.bg, 0.88));
+    grad.addColorStop(0, "rgba(0,0,0,0.45)");
+    grad.addColorStop(0.3, "rgba(0,0,0,0.15)");
+    grad.addColorStop(0.7, "rgba(0,0,0,0.25)");
+    grad.addColorStop(1, "rgba(0,0,0,0.65)");
     ctx.fillStyle = grad;
     ctx.fillRect(0, 0, OUT_W, OUT_H);
 
-    // ২. মূল ভিডিও ফ্রেম
-    const fg = this.foregroundLayout(video, m.fgScale);
+    // ২. মূল ভিডিও ফ্রেম (বড়, স্পষ্ট এবং প্রিমিয়াম শ্যাডো)
+    const fg = this.foregroundLayout(video);
     ctx.save();
-    ctx.shadowColor = "rgba(0,0,0,0.55)";
-    ctx.shadowBlur = 40;
-    ctx.shadowOffsetY = 16;
+    ctx.shadowColor = "rgba(0,0,0,0.65)";
+    ctx.shadowBlur = 45;
+    ctx.shadowOffsetY = 20;
+
     if (this.opts.crop.layout !== "fill") {
-      roundRect(ctx, fg.x, fg.y, fg.w, fg.h, 28);
+      roundRect(ctx, fg.x, fg.y, fg.w, fg.h, 32);
       ctx.fillStyle = "#000";
       ctx.fill();
       ctx.shadowColor = "transparent";
@@ -169,114 +152,107 @@ export class ShortComposer {
     ctx.drawImage(video, fg.x, fg.y, fg.w, fg.h);
     ctx.restore();
 
-    // ৩. ব্যাজ
+    // ৩. হুক কার্ড (আগের চেয়ে বড় ও সুন্দর পজিশনে)
+    if (hook) {
+      ctx.save();
+      ctx.font = `bold 54px ${t.jaFont || "sans-serif"}`;
+      const lines = wrapText(ctx, hook, OUT_W - 160);
+      const lineH = 68;
+      const boxH = lines.length * lineH + 36;
+      const boxY = Math.max(160, fg.y - boxH - 45);
+      const boxW = Math.min(OUT_W - 80, Math.max(...lines.map((l) => ctx.measureText(l).width)) + 90);
+
+      // হুক ব্যাকগ্রাউন্ড
+      roundRect(ctx, (OUT_W - boxW) / 2, boxY, boxW, boxH, 28);
+      ctx.fillStyle = t.hookBg || "#facc15";
+      ctx.shadowColor = "rgba(0,0,0,0.35)";
+      ctx.shadowBlur = 25;
+      ctx.shadowOffsetY = 10;
+      ctx.fill();
+
+      // হুক টেক্সট
+      ctx.shadowColor = "transparent";
+      ctx.fillStyle = t.hookColor || "#000000";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      lines.forEach((l, i) => ctx.fillText(l, OUT_W / 2, boxY + 18 + lineH * i + lineH / 2));
+      ctx.restore();
+    }
+
+    // ৪. JLPT ব্যাজ
     const badge = this.opts.level ? `JLPT ${this.opts.level}` : t.badge;
     if (badge) {
       ctx.save();
-      ctx.font = `700 34px ${t.jaFont}`;
-      const w = ctx.measureText(badge).width + 44;
-      roundRect(ctx, 48, 72, w, 60, 30);
-      ctx.fillStyle = t.accent;
+      ctx.font = `bold 32px ${t.jaFont || "sans-serif"}`;
+      const badgeW = ctx.measureText(badge).width + 48;
+      roundRect(ctx, 50, 75, badgeW, 58, 29);
+      ctx.fillStyle = t.accent || "#f59e0b";
+      ctx.shadowColor = "rgba(0,0,0,0.3)";
+      ctx.shadowBlur = 15;
+      ctx.shadowOffsetY = 6;
       ctx.fill();
-      ctx.fillStyle = t.id === "vocabulary" ? "#ffffff" : "#0b0b12";
+
+      ctx.shadowColor = "transparent";
+      ctx.fillStyle = "#ffffff";
       ctx.textBaseline = "middle";
-      ctx.fillText(badge, 70, 103);
+      ctx.fillText(badge, 74, 104);
       ctx.restore();
     }
 
-    // ৪. হুক কার্ড
-    if (hook) {
-      ctx.save();
-      ctx.font = `${t.weight} 56px ${t.jaFont}`;
-      const lines = wrapText(ctx, hook, OUT_W - 200);
-      const lineH = 72;
-      const boxH = lines.length * lineH + 40;
-      const boxY = Math.max(150, fg.y - boxH - 44);
-      const boxW = Math.min(OUT_W - 96, Math.max(...lines.map((l) => ctx.measureText(l).width)) + 88);
-      if (t.pillStyle !== "none") {
-        roundRect(ctx, (OUT_W - boxW) / 2, boxY, boxW, boxH, t.pillStyle === "rounded" ? 32 : 8);
-        ctx.fillStyle = t.hookBg;
-        ctx.fill();
-      }
-      ctx.fillStyle = t.hookColor;
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      lines.forEach((l, i) => ctx.fillText(l, OUT_W / 2, boxY + 20 + lineH * i + lineH / 2));
-      ctx.restore();
-    }
-
-    // ৫. সাবটাইটেল
+    // ৫. সাবটাইটেল (যদি মোড preserve না হয়)
     if (subtitleMode !== "preserve") {
       const seg = this.currentSegment(time);
       if (seg) {
         const showRomaji = subtitleMode.includes("romaji") && seg.romaji;
         const showEn = subtitleMode.includes("en") && seg.en;
-        const revealEn = t.id !== "listening-challenge" || p > 0.55;
         ctx.save();
         ctx.textAlign = "center";
         ctx.textBaseline = "top";
-        const maxW = OUT_W - 140;
-        let y = fg.y + fg.h + 70;
+        const maxW = OUT_W - 120;
+        let y = fg.y + fg.h + 60;
 
-        ctx.font = `${t.weight} ${t.jaSize}px ${t.jaFont}`;
+        ctx.font = `bold ${t.jaSize || 46}px ${t.jaFont || "sans-serif"}`;
         const jaLines = wrapText(ctx, seg.ja, maxW);
-        if (preserveBurnedSubtitles && subtitleMode === "ja") {
-          ctx.font = `${t.weight} ${Math.round(t.jaSize * 0.85)}px ${t.jaFont}`;
-        }
-        if (t.id === "vocabulary" || t.id === "conversation") {
-          const totalH = jaLines.length * (t.jaSize + 12) + (showRomaji ? 52 : 0) + (showEn ? 56 : 0) + 56;
-          roundRect(ctx, 60, y - 28, OUT_W - 120, totalH, 32);
-          ctx.fillStyle = t.id === "vocabulary" ? "#ffffff" : "rgba(255,255,255,0.10)";
-          ctx.fill();
-        }
+
         for (const l of jaLines) {
-          ctx.lineWidth = 10;
+          ctx.lineWidth = 8;
           ctx.lineJoin = "round";
-          ctx.strokeStyle = t.jaStroke;
-          if (t.jaStroke !== "rgba(255,255,255,0)" && t.jaStroke !== "rgba(0,0,0,0)") ctx.strokeText(l, OUT_W / 2, y);
-          ctx.fillStyle = t.jaColor;
+          ctx.strokeStyle = "rgba(0,0,0,0.85)";
+          ctx.strokeText(l, OUT_W / 2, y);
+          ctx.fillStyle = "#ffffff";
           ctx.fillText(l, OUT_W / 2, y);
-          y += t.jaSize + 12;
+          y += (t.jaSize || 46) + 14;
         }
+
         if (showRomaji) {
-          ctx.font = `600 38px ${t.jaFont}`;
+          ctx.font = `600 36px ${t.jaFont || "sans-serif"}`;
           for (const l of wrapText(ctx, seg.romaji, maxW)) {
-            ctx.fillStyle = t.romajiColor;
-            ctx.fillText(l, OUT_W / 2, y + 6);
+            ctx.fillStyle = t.romajiColor || "#93c5fd";
+            ctx.fillText(l, OUT_W / 2, y + 4);
+            y += 44;
+          }
+        }
+
+        if (showEn) {
+          ctx.font = `500 38px ${t.jaFont || "sans-serif"}`;
+          for (const l of wrapText(ctx, seg.en, maxW)) {
+            ctx.fillStyle = t.enColor || "#e2e8f0";
+            ctx.fillText(l, OUT_W / 2, y + 8);
             y += 48;
           }
-        }
-        if (showEn && revealEn) {
-          ctx.font = `500 40px ${t.jaFont}`;
-          for (const l of wrapText(ctx, seg.en, maxW)) {
-            ctx.fillStyle = t.enColor;
-            ctx.fillText(l, OUT_W / 2, y + 10);
-            y += 52;
-          }
-        } else if (showEn && !revealEn) {
-          ctx.font = `600 40px ${t.jaFont}`;
-          ctx.fillStyle = t.enColor;
-          ctx.fillText("Can you understand it? …", OUT_W / 2, y + 10);
         }
         ctx.restore();
       }
     }
 
-    // ৬. প্রগ্রেস বার
+    // ৬. বটম প্রগ্রেস বার
     if (this.opts.showProgress !== false) {
-      ctx.fillStyle = "rgba(255,255,255,0.18)";
-      ctx.fillRect(0, OUT_H - 10, OUT_W, 10);
-      ctx.fillStyle = t.accent;
-      ctx.fillRect(0, OUT_H - 10, OUT_W * Math.min(1, Math.max(0, p)), 10);
+      ctx.fillStyle = "rgba(255,255,255,0.25)";
+      ctx.fillRect(0, OUT_H - 12, OUT_W, 12);
+      ctx.fillStyle = t.accent || "#f59e0b";
+      ctx.fillRect(0, OUT_H - 12, OUT_W * Math.min(1, Math.max(0, p)), 12);
     }
   }
-}
-
-function hexToRgba(hex: string, a: number) {
-  const h = hex.replace("#", "");
-  const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h;
-  const n = parseInt(full, 16);
-  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
 }
 
 export function pickRecorderMime(): { mime: string; format: "mp4" | "webm" } | null {
@@ -313,8 +289,8 @@ export async function renderShort(
   video.style.position = "fixed";
   video.style.top = "0px";
   video.style.left = "0px";
-  video.style.width = "4px";
-  video.style.height = "4px";
+  video.style.width = "10px";
+  video.style.height = "10px";
   video.style.opacity = "0.01";
   video.style.pointerEvents = "none";
   video.style.zIndex = "-1";
@@ -372,7 +348,6 @@ export async function renderShort(
 
   const totalDuration = Math.max(0.1, opts.endTime - opts.startTime);
 
-  // requestVideoFrameCallback দিয়ে হার্ডওয়্যার পারফেক্ট অডিও-ভিডিও সিঙ্ক
   await new Promise<void>((res) => {
     let active = true;
 
