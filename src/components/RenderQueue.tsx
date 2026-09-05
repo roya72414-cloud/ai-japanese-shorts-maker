@@ -30,7 +30,7 @@ async function loadVideoContext(videoId: number) {
 
 /**
  * Processes shorts with status "waiting" one at a time: renders in-browser to
- * 1080x1920, uploads the result, then moves to the next item.
+ * 1080x1920, uploads directly to Supabase Storage, then updates database.
  */
 export function useRenderQueue(items: QueueShort[], onUpdate: (s: Short) => void, enabled = true) {
   const [activeId, setActiveId] = useState<number | null>(null);
@@ -45,16 +45,23 @@ export function useRenderQueue(items: QueueShort[], onUpdate: (s: Short) => void
       setActiveId(s.id);
       setProgress(0);
       setError("");
+
       const mark = async (patch: Partial<Short>) => {
-        const res = await fetch(`/api/shorts/${s.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch) });
+        const res = await fetch(`/api/shorts/${s.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(patch),
+        });
         const row = (await res.json()) as Short;
         onUpdate(row);
         return row;
       };
+
       try {
         await mark({ status: "rendering", progress: 0 });
         const ctx = await loadVideoContext(s.videoId);
         const segs = ctx.segments.filter((x) => x.end >= s.startTime && x.start <= s.endTime);
+
         const result = await renderShort(
           fileUrl(ctx.storagePath),
           {
@@ -73,12 +80,50 @@ export function useRenderQueue(items: QueueShort[], onUpdate: (s: Short) => void
           },
           (p) => setProgress(Math.round(p * 100)),
         );
-        const up = await fetch(`/api/shorts/${s.id}/render?format=${result.format}`, { method: "POST", body: result.blob, headers: { "Content-Type": result.mime } });
-        const row = (await up.json()) as Short;
-        onUpdate(row);
+
+        // Vercel সার্ভার বাইপাস করে সরাসরি Supabase Storage REST API-তে আপলোড
+        const supabaseUrl =
+          process.env.NEXT_PUBLIC_SUPABASE_URL ||
+          "https://ylebzdcglqdbkobhsqkw.supabase.co";
+        const supabaseKey =
+          process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
+          "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlsZWJ6ZGNnbHFkYmtvYmhzcWt3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDEyODE0NzYsImV4cCI6MjA1Njg1NzQ3Nn0.8m1oN_rYQp7i2u_WzZc5t0D7h_9E4c5L3w8v7b6a1Z4";
+
+        const fileName = `short-${s.id}-${Date.now()}.${result.format}`;
+        const storagePath = `renders/${fileName}`;
+        const targetUrl = `${supabaseUrl.replace(/\/$/, "")}/storage/v1/object/videos/${storagePath}`;
+
+        const up = await fetch(targetUrl, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${supabaseKey}`,
+            "apikey": supabaseKey,
+            "Content-Type": result.mime,
+            "x-upsert": "true",
+          },
+          body: result.blob,
+        });
+
+        if (!up.ok) {
+          const errText = await up.text();
+          throw new Error(errText || "Storage upload failed");
+        }
+
+        // ডাটাবেজে ফাইল পাথ ও কমপ্লিট স্ট্যাটাস আপডেট
+        const updatedRow = await mark({
+          outputPath: storagePath,
+          outputFormat: result.format,
+          outputSize: result.blob.size,
+          status: "complete",
+          progress: 100,
+        });
+
+        onUpdate(updatedRow);
       } catch (e) {
         const raw = e instanceof Error ? e.message : "Render failed";
-        const msg = /NotAllowed|play\(\)|user (gesture|activation)/i.test(raw) ? "The browser needs a click before it can render with audio. Press Retry." : raw;
+        const msg = /NotAllowed|play\(\)|user (gesture|activation)/i.test(raw)
+          ? "The browser needs a click before it can render with audio. Press Retry."
+          : raw;
         setError(msg);
         await mark({ status: "failed", progress: 0 });
       } finally {
@@ -95,14 +140,17 @@ export function useRenderQueue(items: QueueShort[], onUpdate: (s: Short) => void
     busy.current = true;
     processOne(next).finally(() => {
       busy.current = false;
-      // force re-evaluation so the next waiting item starts
       setTick((t) => t + 1);
     });
   }, [items, processOne, enabled, tick]);
 
   const retry = useCallback(
     async (s: Short) => {
-      const res = await fetch(`/api/shorts/${s.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "waiting", progress: 0 }) });
+      const res = await fetch(`/api/shorts/${s.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "waiting", progress: 0 }),
+      });
       onUpdate(await res.json());
     },
     [onUpdate],
@@ -111,7 +159,21 @@ export function useRenderQueue(items: QueueShort[], onUpdate: (s: Short) => void
   return { activeId, progress, error, retry };
 }
 
-export function QueuePanel({ items, activeId, progress, error, onRetry, onStart }: { items: Short[]; activeId: number | null; progress: number; error: string; onRetry: (s: Short) => void; onStart?: () => void }) {
+export function QueuePanel({
+  items,
+  activeId,
+  progress,
+  error,
+  onRetry,
+  onStart,
+}: {
+  items: Short[];
+  activeId: number | null;
+  progress: number;
+  error: string;
+  onRetry: (s: Short) => void;
+  onStart?: () => void;
+}) {
   const done = items.filter((s) => s.status === "complete").length;
   const waiting = items.filter((s) => s.status === "waiting").length;
   return (
@@ -120,9 +182,16 @@ export function QueuePanel({ items, activeId, progress, error, onRetry, onStart 
         <p className="text-sm font-semibold text-slate-900">Render queue</p>
         <div className="flex items-center gap-2">
           {onStart && waiting > 0 && activeId === null && (
-            <button onClick={onStart} className="rounded-md bg-brand-500 px-2.5 py-1 text-xs font-semibold text-white hover:bg-brand-600">Start rendering</button>
+            <button
+              onClick={onStart}
+              className="rounded-md bg-brand-500 px-2.5 py-1 text-xs font-semibold text-white hover:bg-brand-600"
+            >
+              Start rendering
+            </button>
           )}
-          <span className="text-xs tabular-nums text-slate-500">{done}/{items.length} complete</span>
+          <span className="text-xs tabular-nums text-slate-500">
+            {done}/{items.length} complete
+          </span>
         </div>
       </div>
       <ul className="max-h-72 divide-y divide-slate-100 overflow-auto">
@@ -148,9 +217,20 @@ export function QueuePanel({ items, activeId, progress, error, onRetry, onStart 
                 {active && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
                 {s.status === "waiting" && !active && <Clock className="h-3.5 w-3.5" />}
                 {s.status === "failed" && <AlertCircle className="h-3.5 w-3.5" />}
-                {active ? `Rendering ${progress}%` : s.status === "waiting" ? "Waiting" : s.status === "complete" ? "Complete" : "Failed"}
+                {active
+                  ? `Rendering ${progress}%`
+                  : s.status === "waiting"
+                  ? "Waiting"
+                  : s.status === "complete"
+                  ? "Complete"
+                  : "Failed"}
                 {s.status === "failed" && (
-                  <button onClick={() => onRetry(s)} className="ml-1 rounded bg-rose-50 px-1.5 py-0.5 text-[10px] hover:bg-rose-100">Retry</button>
+                  <button
+                    onClick={() => onRetry(s)}
+                    className="ml-1 rounded bg-rose-50 px-1.5 py-0.5 text-[10px] hover:bg-rose-100"
+                  >
+                    Retry
+                  </button>
                 )}
               </span>
             </li>
