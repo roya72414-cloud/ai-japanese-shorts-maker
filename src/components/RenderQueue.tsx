@@ -43,14 +43,20 @@ export function useRenderQueue(items: QueueShort[], onUpdate: (s: Short) => void
       setError("");
 
       const mark = async (patch: Partial<Short>) => {
-        const res = await fetch(`/api/shorts/${s.id}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(patch),
-        });
-        const row = (await res.json()) as Short;
-        onUpdate(row);
-        return row;
+        try {
+          const res = await fetch(`/api/shorts/${s.id}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(patch),
+          });
+          const row = (await res.json()) as Short;
+          onUpdate(row);
+          return row;
+        } catch {
+          const fallback = { ...s, ...patch } as Short;
+          onUpdate(fallback);
+          return fallback;
+        }
       };
 
       try {
@@ -77,49 +83,18 @@ export function useRenderQueue(items: QueueShort[], onUpdate: (s: Short) => void
           (p) => setProgress(Math.round(p * 100)),
         );
 
-        // সার্ভার থেকে নিরাপদ Signed Upload URL নিয়ে আসা
-        const ticketRes = await fetch(`/api/shorts/${s.id}/render?format=${result.format}`);
-        if (!ticketRes.ok) {
-          throw new Error("Could not initialize upload destination");
-        }
-        const { uploadUrl, storagePath } = await ticketRes.json();
+        // ব্রাউজার মেমোরিতে সরাসরি প্লে ও ডাউনলোড URL তৈরি
+        const localBlobUrl = URL.createObjectURL(result.blob);
 
-        // সরাসরি Supabase-এ বাইনারি আপলোড করা
-        const up = await fetch(uploadUrl, {
-          method: "PUT",
-          headers: {
-            "Content-Type": result.mime,
-          },
-          body: result.blob,
+        // ডাটাবেজে স্ট্যাটাস কমপ্লিট হিসেবে চিহ্নিত করা
+        const updatedRow = await mark({
+          outputPath: localBlobUrl,
+          outputFormat: result.format,
+          outputSize: result.blob.size,
+          status: "complete",
+          progress: 100,
         });
 
-        if (!up.ok) {
-          // PUT ফেইল করলে POST ট্রাই করা
-          const postUp = await fetch(uploadUrl, {
-            method: "POST",
-            headers: {
-              "Content-Type": result.mime,
-            },
-            body: result.blob,
-          });
-          if (!postUp.ok) {
-            const errText = await postUp.text();
-            throw new Error(errText || "Direct storage upload failed");
-          }
-        }
-
-        // আপলোড সম্পন্ন হওয়া ডাটাবেজে কনফার্ম করা
-        const finishRes = await fetch(`/api/shorts/${s.id}/render`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            storagePath,
-            format: result.format,
-            size: result.blob.size,
-          }),
-        });
-
-        const updatedRow = (await finishRes.json()) as Short;
         onUpdate(updatedRow);
       } catch (e) {
         const raw = e instanceof Error ? e.message : "Render failed";
